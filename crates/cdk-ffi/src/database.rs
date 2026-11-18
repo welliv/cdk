@@ -2332,6 +2332,7 @@ mod tests {
                 key.clone().into(),
             )),
             p2pk_e: Some(key.public_key()),
+            spend_info: None,
         };
         let mut info = CdkProofInfo::new(
             proof,
