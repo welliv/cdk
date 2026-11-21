@@ -5,6 +5,7 @@ use std::time::Duration;
 use cdk_common::error::Error;
 use cdk_common::grpc::{VersionInterceptor, VERSION_SIGNATORY_HEADER};
 use cdk_common::stream::{BackoffPolicy, SupervisedStream};
+use cdk_common::work_pool::Admission;
 use cdk_common::{BlindSignature, BlindedMessage, Proof};
 use tokio::sync::watch;
 use tonic::codegen::InterceptedService;
@@ -218,6 +219,14 @@ macro_rules! handle_error {
     }};
 }
 
+/// Map a gRPC status from the signatory to a signatory error.
+fn status_to_error(status: tonic::Status) -> Error {
+    match status.code() {
+        tonic::Code::ResourceExhausted => Error::Busy,
+        _ => Error::Custom(status.to_string()),
+    }
+}
+
 #[async_trait::async_trait]
 impl Signatory for SignatoryRpcClient {
     fn name(&self) -> String {
@@ -225,12 +234,17 @@ impl Signatory for SignatoryRpcClient {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn blind_sign(&self, request: Vec<BlindedMessage>) -> Result<Vec<BlindSignature>, Error> {
+    async fn blind_sign(
+        &self,
+        request: Vec<BlindedMessage>,
+        admission: Admission,
+    ) -> Result<Vec<BlindSignature>, Error> {
         let req = super::BlindedMessages {
             blinded_messages: request
                 .into_iter()
                 .map(|blind_message| blind_message.into())
                 .collect(),
+            admission: proto::Admission::from(admission).into(),
         };
 
         self.client
@@ -244,7 +258,7 @@ impl Signatory for SignatoryRpcClient {
                     .map(|blinded_signature| blinded_signature.try_into())
                     .collect()
             })
-            .map_err(|e| Error::Custom(e.to_string()))?
+            .map_err(status_to_error)?
     }
 
     #[tracing::instrument(skip_all)]
@@ -263,7 +277,7 @@ impl Signatory for SignatoryRpcClient {
                     Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))
                 }
             })
-            .map_err(|e| Error::Custom(e.to_string()))?
+            .map_err(status_to_error)?
     }
 
     #[tracing::instrument(skip_all)]
@@ -317,8 +331,11 @@ impl Signatory for SignatoryRpcClient {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use cdk_common::nut02::KeySetVersion;
     use cdk_common::secret::Secret;
+    use cdk_common::work_pool::WorkPool;
     use cdk_common::{Amount, CurrencyUnit, SecretKey};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -329,21 +346,28 @@ mod tests {
 
     /// Serves a fresh `DbSignatory` over gRPC on a local port and returns it with a client.
     async fn remote_signatory() -> (Arc<DbSignatory>, SignatoryRpcClient) {
+        remote_signatory_with_pool(WorkPool::sized_to_host()).await
+    }
+
+    /// Like [`remote_signatory`], with the signatory running its work on `work_pool`.
+    async fn remote_signatory_with_pool(
+        work_pool: WorkPool,
+    ) -> (Arc<DbSignatory>, SignatoryRpcClient) {
         let store = Arc::new(
             cdk_sqlite::mint::memory::empty()
                 .await
                 .expect("in-memory db"),
         );
-        let signatory = Arc::new(
-            DbSignatory::new(
-                store,
-                b"remote-verify",
-                Default::default(),
-                Default::default(),
-            )
-            .await
-            .expect("DbSignatory::new"),
-        );
+        let mut signatory = DbSignatory::new(
+            store,
+            b"remote-verify",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+        signatory.set_work_pool(work_pool);
+        let signatory = Arc::new(signatory);
         signatory
             .rotate_keyset(RotateKeyArguments {
                 unit: CurrencyUnit::Sat,
@@ -429,6 +453,29 @@ mod tests {
         assert!(matches!(local_err, Error::UnknownKeySet));
         assert!(
             matches!(remote_err, Error::UnknownKeySet),
+            "unexpected remote error: {remote_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_proofs_reports_a_busy_signatory() {
+        // A pool with no slots and no queue refuses every verification.
+        let (local, remote) = remote_signatory_with_pool(WorkPool::new(0, 0, Duration::ZERO)).await;
+        let keyset = local.keysets().await.expect("keysets").keysets[0].clone();
+        let proof = Proof::new(
+            Amount::from(1),
+            keyset.id,
+            Secret::generate(),
+            SecretKey::generate().public_key(),
+        );
+
+        let remote_err = remote
+            .verify_proofs(vec![proof])
+            .await
+            .expect_err("busy signatory refuses verification");
+
+        assert!(
+            matches!(remote_err, Error::Busy),
             "unexpected remote error: {remote_err:?}"
         );
     }
