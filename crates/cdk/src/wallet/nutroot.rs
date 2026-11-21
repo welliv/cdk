@@ -184,12 +184,21 @@ impl Wallet {
             })
             .cloned()
             .collect();
-        let mut keys = self.own_v3_keys(&own).await?;
+        let keys = self.own_v3_keys(&own).await?;
+        Self::sign_v3_swap_inputs(&transaction, request.inputs_mut(), keys, received)
+    }
+
+    pub(super) fn sign_v3_swap_inputs(
+        transaction: &Transaction,
+        inputs: &mut Proofs,
+        mut keys: V3Keys,
+        received: &V3Spends,
+    ) -> Result<(), Error> {
         keys.extend(received.iter().filter_map(|(point, spend)| match spend {
             V3Spend::KeyPath(key) => Some((*point, key.clone())),
             V3Spend::ScriptPath { .. } => None,
         }));
-        for (index, proof) in request.inputs_mut().iter_mut().enumerate() {
+        for (index, proof) in inputs.iter_mut().enumerate() {
             if !is_v3(proof) {
                 continue;
             }
@@ -202,7 +211,7 @@ impl Wallet {
                 proof.witness = Some(witness.into());
             }
         }
-        Self::sign_v3_inputs(&transaction, request.inputs_mut(), &keys)
+        Self::sign_v3_inputs(transaction, inputs, &keys)
     }
 
     /// Sign every v3 input of `transaction` by the key path

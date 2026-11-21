@@ -269,7 +269,8 @@ mod tests {
             0,
             Some(222),
             KeySetVersion::Version00,
-        );
+        )
+        .unwrap();
 
         let info = MintKeySetInfo {
             id: key.id,
