@@ -1420,7 +1420,7 @@ impl Mint {
                 });
             }
 
-            let blinded_secrets: Vec<PublicKey> =
+            let blinded_secrets: Vec<DhkePoint> =
                 blinded_messages.iter().map(|b| b.blinded_secret).collect();
 
             let blinded_signatures = self
@@ -2358,7 +2358,7 @@ mod tests {
             .blind_sign(outputs.clone(), Admission::Unbounded)
             .await
             .unwrap();
-        signatures[1].c = SecretKey::generate().public_key();
+        signatures[1].c = SecretKey::generate().public_key().into();
 
         let blinded_secrets: Vec<_> = outputs.iter().map(|output| output.blinded_secret).collect();
         let mut tx = mint.localstore.begin_transaction().await.unwrap();
@@ -2395,7 +2395,7 @@ mod tests {
             let signature = BlindSignature {
                 amount: Amount::from(1),
                 keyset_id,
-                c: SecretKey::generate().public_key(),
+                c: SecretKey::generate().public_key().into(),
                 dleq: None,
             };
 
