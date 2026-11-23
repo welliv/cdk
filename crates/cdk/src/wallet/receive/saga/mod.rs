@@ -159,6 +159,7 @@ impl<'a> ReceiveSaga<'a, Initial> {
                         &opts.p2pk_signing_keys,
                         opts.v3_min_refund_horizon
                             .unwrap_or(crate::wallet::nutroot::DEFAULT_MIN_REFUND_HORIZON),
+                        opts.v3_script_path.then_some(opts.preimages.as_slice()),
                     )?,
                 };
                 v3_keys.insert(proof.secret.v3_point()?, key);
