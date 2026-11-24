@@ -1,0 +1,29 @@
+[package]
+name = "cdk-nwc-policy-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "CLI for managing CDK NWC policy connections"
+
+[[bin]]
+name = "nwc-policy-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait = { workspace = true }
+cdk = { workspace = true, features = ["wallet", "nwc"] }
+cdk-nostr = { workspace = true, features = ["nwc"] }
+cdk-nwc-forward = { path = "../cdk-nwc-forward" }
+cdk-nwc-policy = { path = "../cdk-nwc-policy" }
+cdk-sqlite = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+hex = "0.4"
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[lints]
+workspace = true

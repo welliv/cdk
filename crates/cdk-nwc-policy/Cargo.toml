@@ -1,0 +1,29 @@
+[package]
+name = "cdk-nwc-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Per-connection policy enforcement for Cashu NWC wallet services"
+
+[dependencies]
+async-trait = { workspace = true }
+cdk-nostr = { workspace = true, features = ["nwc"] }
+fs2 = "0.4"
+hex = "0.4"
+lightning-invoice = { workspace = true }
+nostr = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

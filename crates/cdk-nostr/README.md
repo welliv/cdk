@@ -10,6 +10,10 @@ Nostr support for the Cashu Development Kit in a single crate.
   wraps addressed to an identity, unwraps them, and delivers the rumors to a
   `NostrInboxListener` callback.
 - **`nwc`** (feature `nwc`) — NIP-47 Nostr Wallet Connect wallet service.
+  Handlers can override the `*_with_context` methods to receive a
+  `RequestContext` with the event ID, authorized client key and
+  service-received timestamp. Existing handlers keep working because the default methods
+  delegate to the ordinary handler methods.
 - **`npubcash`** (feature `npubcash`) — npub.cash API client (quotes, settings,
   NIP-98/JWT auth).
 

@@ -33,7 +33,7 @@ use nostr_sdk::prelude::{
 use tokio_util::sync::CancellationToken;
 
 use crate::nwc::error::{Error, Result};
-use crate::nwc::handler::NwcRequestHandler;
+use crate::nwc::handler::{NwcRequestHandler, RequestContext};
 
 /// Commands advertised in the info event and reported by `get_info`.
 ///
@@ -169,11 +169,12 @@ impl NwcService {
 
         // Only consider requests created from now on, addressed to us, authored
         // by the authorized client.
+        let started_at = Timestamp::now();
         let filter = Filter::new()
             .kind(Kind::WalletConnectRequest)
             .author(self.client_pubkey)
             .pubkey(self.service_keys.public_key())
-            .since(Timestamp::now());
+            .since(started_at);
 
         // Take the notification stream before subscribing so no request can
         // slip between subscription creation and the receive loop.
@@ -215,8 +216,8 @@ impl NwcService {
                 continue;
             }
 
-            if event.is_expired() {
-                tracing::debug!("Dropping expired NWC request {}", event.id);
+            if event.is_expired() || is_before_start(&event, started_at) {
+                tracing::debug!("Dropping stale NWC request {}", event.id);
                 continue;
             }
 
@@ -262,6 +263,20 @@ fn info_event_encryption_tag() -> Tag {
     Tag::custom("encryption", [SUPPORTED_ENCRYPTION_SCHEMES])
 }
 
+/// Return true when a request predates this service run.
+fn is_before_start(event: &Event, started_at: Timestamp) -> bool {
+    event.created_at < started_at
+}
+
+/// Build policy context with service-received time, not client-supplied time.
+fn request_context(event: &Event) -> RequestContext {
+    RequestContext {
+        event_id: event.id.to_hex(),
+        client_pubkey: event.pubkey.to_hex(),
+        received_at: Timestamp::now().as_secs(),
+    }
+}
+
 /// Decrypt, dispatch, and respond to a single request event.
 ///
 /// Any failure is logged and (where possible) answered with a NIP-47 error
@@ -281,7 +296,8 @@ where
         }
     };
 
-    let response = dispatch(handler, request).await;
+    let context = request_context(event);
+    let response = dispatch(handler, request, &context).await;
 
     if let Err(e) = send_response(
         service_keys,
@@ -319,29 +335,35 @@ fn decrypt_request(
 }
 
 /// Dispatch a decoded request to the handler and build the NIP-47 response.
-async fn dispatch<H>(handler: &H, request: Request) -> Response
+async fn dispatch<H>(handler: &H, request: Request, context: &RequestContext) -> Response
 where
     H: NwcRequestHandler + ?Sized,
 {
     let result_type = request.method;
 
     let result: std::result::Result<ResponseResult, NIP47Error> = match request.params {
-        RequestParams::GetInfo => handler.get_info().await.map(ResponseResult::GetInfo),
-        RequestParams::GetBalance => handler.get_balance().await.map(ResponseResult::GetBalance),
+        RequestParams::GetInfo => handler
+            .get_info_with_context(context)
+            .await
+            .map(ResponseResult::GetInfo),
+        RequestParams::GetBalance => handler
+            .get_balance_with_context(context)
+            .await
+            .map(ResponseResult::GetBalance),
         RequestParams::MakeInvoice(params) => handler
-            .make_invoice(params)
+            .make_invoice_with_context(params, context)
             .await
             .map(ResponseResult::MakeInvoice),
         RequestParams::PayInvoice(params) => handler
-            .pay_invoice(params)
+            .pay_invoice_with_context(params, context)
             .await
             .map(ResponseResult::PayInvoice),
         RequestParams::LookupInvoice(params) => handler
-            .lookup_invoice(params)
+            .lookup_invoice_with_context(params, context)
             .await
             .map(ResponseResult::LookupInvoice),
         RequestParams::ListTransactions(params) => handler
-            .list_transactions(params)
+            .list_transactions_with_context(params, context)
             .await
             .map(ResponseResult::ListTransactions),
         // Commands outside the supported set.
@@ -510,6 +532,107 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct ContextHandler {
+        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::nwc::handler::NwcRequestHandler for ContextHandler {
+        async fn get_info(&self) -> std::result::Result<GetInfoResponse, NIP47Error> {
+            Err(NIP47Error {
+                code: ErrorCode::Internal,
+                message: "no".into(),
+            })
+        }
+        async fn get_balance(&self) -> std::result::Result<GetBalanceResponse, NIP47Error> {
+            Ok(GetBalanceResponse { balance: 1 })
+        }
+        async fn get_balance_with_context(
+            &self,
+            ctx: &crate::nwc::handler::RequestContext,
+        ) -> std::result::Result<GetBalanceResponse, NIP47Error> {
+            *self.seen.lock().map_err(|_| NIP47Error {
+                code: ErrorCode::Internal,
+                message: "lock poisoned".into(),
+            })? = Some(ctx.event_id.clone());
+            self.get_balance().await
+        }
+        async fn make_invoice(
+            &self,
+            _: MakeInvoiceRequest,
+        ) -> std::result::Result<MakeInvoiceResponse, NIP47Error> {
+            unreachable!()
+        }
+        async fn pay_invoice(
+            &self,
+            _: PayInvoiceRequest,
+        ) -> std::result::Result<PayInvoiceResponse, NIP47Error> {
+            unreachable!()
+        }
+        async fn lookup_invoice(
+            &self,
+            _: LookupInvoiceRequest,
+        ) -> std::result::Result<LookupInvoiceResponse, NIP47Error> {
+            unreachable!()
+        }
+        async fn list_transactions(
+            &self,
+            _: ListTransactionsRequest,
+        ) -> std::result::Result<Vec<LookupInvoiceResponse>, NIP47Error> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_request_context() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = ContextHandler { seen: seen.clone() };
+        let ctx = crate::nwc::handler::RequestContext {
+            event_id: "evt-42".to_owned(),
+            client_pubkey: "client".to_owned(),
+            received_at: 123,
+        };
+
+        let response = dispatch(&handler, Request::get_balance(), &ctx).await;
+
+        assert!(response.error.is_none());
+        assert_eq!(seen.lock().expect("lock").as_deref(), Some("evt-42"));
+    }
+
+    #[test]
+    fn stale_request_is_rejected_without_trusting_relay_filter() {
+        let keys = Keys::new(SecretKey::from_slice(&[2; 32]).expect("secret key"));
+        let old = EventBuilder::new(Kind::WalletConnectRequest, "old")
+            .custom_created_at(Timestamp::from_secs(1))
+            .finalize(&keys)
+            .expect("event");
+        let fresh = EventBuilder::new(Kind::WalletConnectRequest, "fresh")
+            .custom_created_at(Timestamp::now())
+            .finalize(&keys)
+            .expect("event");
+        let started_at = Timestamp::from_secs(1_700_000_000);
+
+        assert!(is_before_start(&old, started_at));
+        assert!(!is_before_start(&fresh, started_at));
+    }
+
+    #[test]
+    fn request_context_uses_received_time_not_event_time() {
+        let keys = Keys::new(SecretKey::from_slice(&[1; 32]).expect("secret key"));
+        let event = EventBuilder::new(Kind::WalletConnectRequest, "request")
+            .custom_created_at(Timestamp::from_secs(1))
+            .finalize(&keys)
+            .expect("event");
+
+        let context = request_context(&event);
+
+        assert_eq!(context.event_id, event.id.to_hex());
+        assert_eq!(context.client_pubkey, event.pubkey.to_hex());
+        assert!(context.received_at >= 1_700_000_000);
+        assert!(context.received_at > event.created_at.as_secs());
+    }
+
     /// Encrypt a request the way a client would, with the chosen scheme.
     fn encrypt_request(
         client_secret: &SecretKey,
@@ -550,7 +673,12 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_get_balance_ok() {
-        let response = dispatch(&MockHandler, Request::get_balance()).await;
+        let context = crate::nwc::handler::RequestContext {
+            event_id: "event-1".to_owned(),
+            client_pubkey: "client".to_owned(),
+            received_at: 1,
+        };
+        let response = dispatch(&MockHandler, Request::get_balance(), &context).await;
         assert!(response.error.is_none());
         match response.result {
             Some(ResponseResult::GetBalance(b)) => assert_eq!(b.balance, 5000),
@@ -569,7 +697,12 @@ mod tests {
             tlv_records: Vec::new(),
         });
 
-        let response = dispatch(&MockHandler, request).await;
+        let context = crate::nwc::handler::RequestContext {
+            event_id: "event-2".to_owned(),
+            client_pubkey: "client".to_owned(),
+            received_at: 1,
+        };
+        let response = dispatch(&MockHandler, request, &context).await;
         let error = response.error.expect("unsupported method should error");
         assert_eq!(error.code, ErrorCode::NotImplemented);
         assert!(response.result.is_none());

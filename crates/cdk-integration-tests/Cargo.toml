@@ -61,6 +61,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 uuid = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
+cdk-nwc-forward = { path = "../cdk-nwc-forward" }
+cdk-nwc-policy = { path = "../cdk-nwc-policy" }
 bip39 = { workspace = true, features = ["rand"] }
 anyhow.workspace = true
 axum.workspace = true
@@ -70,6 +72,7 @@ cdk-signatory = { workspace = true }
 cdk-postgres = { workspace = true }
 cdk-ffi = { workspace = true, features = ["npubcash", "bip353"] }
 nwc = { version = "0.45.0", default-features = false }
+reqwest = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
