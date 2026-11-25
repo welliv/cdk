@@ -100,6 +100,40 @@ fees. If the main wallet is empty it prints a signet invoice to pay first.
 `--no-relay` runs the agent in-process; any Cashu mint URL works (a local
 FakeWallet mint needs no funding).
 
+### Live signet, 26 Nov 2026 (Africa/Nairobi)
+
+Run against `https://cashu.mutinynet.com` with
+`--work-dir /workspace/nwc-test/rogue-demo` (the already-built
+`target/debug/examples/rogue_agent` binary; no rebuild). The 53 sat mint
+invoice was paid once from a signet NWC wallet (53 sat + 1 sat Lightning
+fee). After the demo, leftover main-wallet funds were sent back to that
+wallet with `make_invoice` (35 sat then 2 sat; 2 sat melt fee each).
+
+```text
+funded: main wallet holds 53 sat
+pocket #0 funded with 30 sat (cost 32 sat). main: 21 sat, pocket: 30 sat
+agent get_balance: 30 sat (pocket only)
+round 1: agent paid 7 sat to attacker (fee 2000 msat, 18020 ms)
+round 2: agent paid 7 sat to attacker (fee 2000 msat, 18016 ms)
+round 3: payment failed OTHER "relay not connected"; trying a new invoice
+round 4: CUT OFF: INSUFFICIENT_BALANCE "insufficient pocket balance" (18016 ms)
+agent asks for 21 sat (= whole main wallet): REFUSED INSUFFICIENT_BALANCE
+revoked: swept 2 sat home (0 sat pending)
+| pocket spent before cut-off (incl. fees) | 27 sat |
+| attacker wallet held | 21 sat |
+| main during attack | 21 -> 21 sat (untouched) |
+| loot returned to main | 19 sat |
+| main at end | 42 sat |
+```
+
+Round 3's relay error hid a successful 7 sat payment: pocket spend was 27 sat
+(3 × 7 sat + 3 × 2 sat mint fees), and the attacker held 21 sat, which was
+swapped back to main (19 sat after a 2 sat swap fee). Exit 0.
+
+1 sat remains in the demo main wallet (below the 2 sat melt-fee floor).
+Net cost to the funding wallet: **17 sat** (54 sat paid out, 37 sat
+returned, 0 sat receive fees).
+
 ## Tests
 
 ```bash
