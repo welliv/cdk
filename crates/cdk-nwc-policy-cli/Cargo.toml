@@ -19,6 +19,7 @@ cdk = { workspace = true, features = ["wallet", "nwc"] }
 cdk-nostr = { workspace = true, features = ["nwc"] }
 cdk-nwc-forward = { path = "../cdk-nwc-forward" }
 cdk-nwc-policy = { path = "../cdk-nwc-policy" }
+cdk-nwc-pocket = { path = "../cdk-nwc-pocket" }
 cdk-sqlite = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 hex = "0.4"

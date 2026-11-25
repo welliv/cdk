@@ -10,6 +10,8 @@ use cdk::wallet::Wallet;
 use cdk_nwc_policy::BudgetPeriod;
 use tokio::task::JoinHandle;
 
+pub mod pocket;
+
 /// Parse a `--budget-period` value.
 pub fn parse_budget_period(value: &str) -> Result<BudgetPeriod> {
     match value.trim().to_ascii_lowercase().as_str() {

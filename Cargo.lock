@@ -1790,6 +1790,7 @@ dependencies = [
  "cdk",
  "cdk-nostr",
  "cdk-nwc-forward",
+ "cdk-nwc-pocket",
  "cdk-nwc-policy",
  "cdk-sqlite",
  "clap",
