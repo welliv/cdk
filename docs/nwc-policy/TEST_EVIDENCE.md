@@ -65,9 +65,23 @@ Policy-layer checks:
 
 This proves transport compatibility, real signet payment behavior, method filtering and budget accounting against a live Cashu-backed NWC service. It does not exercise CWC or our local wallet backend, which remain covered by their own unit/e2e suites.
 
+## Mutinynet deployment and back-and-forth validation
+
+A fresh CDK wallet was deployed against `https://cashu.mutinynet.com`, funded with 5,000 sat through `mutinynet-cli`, and fronted by our own `cdk-nwc-policy` connection. See [MUTINYNET_LIVE_EVIDENCE.md](MUTINYNET_LIVE_EVIDENCE.md) for full details.
+
+Verified:
+
+- real faucet funding through `mutinynet-cli`;
+- our own NWC connection backed by the CDK wallet;
+- discovery, balance, invoice creation, lookup, payment and history;
+- method filtering, quota enforcement, reservation cleanup, revocation and expiry;
+- self-payment settlement inside our own CDK stack.
+
+The run also found two interoperability failures on the Alby Cashu path: incoming invoices remained `pending` after externally observed payment, and outbound payment failed with `no preimage in melt response`. These are documented, not hidden.
+
 ## Not run here
 
 - `cdk-postgres` tests: require a running PostgreSQL instance.
 - Full `cdk-integration-tests`: require regtest/Nostr relay infrastructure.
 - `just quick-check`: blocked locally because `nixpkgs-fmt` is not installed.
-- Live Mutinynet/Alby test: ignored by default and intentionally not run in this environment.
+- Relay-layer replay forging: duplicate-event rejection is covered by unit/e2e suites; a signed event with the same ID was not replayed during this live run.

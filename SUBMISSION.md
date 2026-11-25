@@ -85,6 +85,7 @@ See [TEST_EVIDENCE.md](docs/nwc-policy/TEST_EVIDENCE.md).
 
 - [Plain-language walkthrough](docs/nwc-policy/EXPLAINER.md)
 - [Demo and reproduction steps](docs/nwc-policy/DEMO.md)
+- [Live Mutinynet evidence](docs/nwc-policy/MUTINYNET_LIVE_EVIDENCE.md)
 - [Test evidence](docs/nwc-policy/TEST_EVIDENCE.md)
 - [November delta](docs/nwc-policy/NOVEMBER_DELTA.md)
 - [Manager CLI guide](NWC_POLICY_MANAGER_CLI.md)
