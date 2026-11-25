@@ -77,7 +77,7 @@ Verified:
 - method filtering, quota enforcement, reservation cleanup, revocation and expiry;
 - self-payment settlement inside our own CDK stack.
 
-The run also found inconsistent failures on the Alby Cashu path: incoming invoices remained `pending` after externally observed payment, and outbound payment failed with `no preimage in melt response` or `outputs are pending [Internal]` with the mint quote staying `unpaid`. The ignored `nwc_policy_mutinynet_live` harness was re-run four times and failed each time. These results are documented, not hidden, and are not counted as proof of Alby interoperability.
+The run also found observed Alby Cashu discrepancies: incoming invoices remained `pending` in lookup, and outbound payment failed with `no preimage in melt response` or `outputs are pending [Internal]` with the mint quote staying `unpaid`. The two Alby NWC connections are separate connections to the same wallet, so balance comparisons between them are not independent proof. The ignored `nwc_policy_mutinynet_live` harness was re-run four times and failed each time. These results are documented, not hidden, and are not counted as proof of Alby interoperability.
 
 ## Not run here
 

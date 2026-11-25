@@ -79,7 +79,7 @@ We validated against two signet Alby Hub Cashu NWC connections:
 - a 1,000 msat signet payment succeeded through our policy layer;
 - the ledger recorded exactly 1,000 msat used, with no open reservations.
 
-A later Mutinynet deployment validated our own CDK-backed NWC connection end to end, including self-payment settlement and policy enforcement. Interoperability with the Alby Cashu backend was inconsistent: the ignored live harness failed repeatedly with `outputs are pending [Internal]` and an unpaid mint quote. We do not claim universal Alby Cashu interoperability; see the [Mutinynet evidence](docs/nwc-policy/MUTINYNET_LIVE_EVIDENCE.md).
+A later Mutinynet deployment validated our own CDK-backed NWC connection end to end, including self-payment settlement and policy enforcement. Interoperability with the Alby Cashu backend was not demonstrated in this environment: lookup states stayed `pending` on incoming invoices, and outbound attempts failed with `outputs are pending [Internal]` and an unpaid mint quote. The two Alby connections share one wallet, so balance comparisons are not independent proof. We do not claim universal Alby Cashu interoperability; see the [Mutinynet evidence](docs/nwc-policy/MUTINYNET_LIVE_EVIDENCE.md).
 
 See [TEST_EVIDENCE.md](docs/nwc-policy/TEST_EVIDENCE.md).
 

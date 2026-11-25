@@ -4,6 +4,8 @@ Run on 2026-11-25 UTC against a freshly deployed CDK wallet using `https://cashu
 
 ## Deployment
 
+The two Alby NWC URIs used in testing are separate connections to the **same underlying Alby wallet** and share its balance. Balance comparisons between those two connections are therefore not independent evidence of settlement.
+
 - CDK workdir: isolated `0600` scratch directory.
 - Mint: `https://cashu.mutinynet.com`.
 - Funding: 5,000 sat minted after paying a Cashu mint quote with `mutinynet-cli`.
@@ -45,7 +47,7 @@ tx: incoming settled 5000000 msat
 
 To isolate the issue, a fresh 1,000 msat Alby invoice was paid directly with `mutinynet-cli lightning`. The faucet returned a payment preimage, but Alby still reported the invoice as `pending`.
 
-This indicates the pending-invoice behavior is on the Alby Cashu path, not in our policy layer.
+Because the two Alby connections share one wallet balance, this is reported as a **lookup-state discrepancy**, not as balance proof. It does not by itself prove funds did or did not settle.
 
 ### Alby Hub → CDK
 
@@ -151,8 +153,4 @@ The live run verifies:
 - method allowlists, quota enforcement, reservation cleanup, revocation and expiry;
 - self-payment settlement inside our own stack.
 
-It also uncovered inconsistent interoperability failures on the Alby Cashu NWC
-path: incoming invoices remained `pending` after externally observed payment,
-and outbound payment failed with `no preimage in melt response` or
-`outputs are pending [Internal]` with the mint quote staying unpaid. These are
-recorded honestly and are outside our policy layer.
+It also uncovered observed Alby Cashu interoperability discrepancies: incoming invoices remained `pending` in lookup, and outbound payments failed with `no preimage in melt response` or `outputs are pending [Internal]` with the mint quote staying unpaid. Because the two Alby connections share one wallet balance, balance comparisons are not used as proof either way. These observations are outside our policy layer and are not claimed as universal interoperability.
