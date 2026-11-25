@@ -124,9 +124,12 @@ pub enum PolicyError {
     /// The method is not allowed for this connection.
     #[error("method not allowed: {0}")]
     Restricted(String),
-    /// The request exceeds a budget cap.
+    /// The request exceeds the remaining period budget.
     #[error("budget exceeded")]
     QuotaExceeded,
+    /// The request exceeds the per-payment cap.
+    #[error("payment exceeds per-payment cap")]
+    PaymentCapExceeded,
     /// The connection has expired.
     #[error("connection expired")]
     Expired,
@@ -341,7 +344,7 @@ impl PolicyStore {
             }
             if let Some(cap) = file.connections[index].max_single_payment_msat {
                 if amount_msat > cap {
-                    return Err(PolicyError::QuotaExceeded);
+                    return Err(PolicyError::PaymentCapExceeded);
                 }
             }
 
@@ -638,6 +641,9 @@ fn map_policy_error(error: PolicyError) -> NIP47Error {
             &format!("method not allowed: {method}"),
         ),
         PolicyError::QuotaExceeded => nip47_error(ErrorCode::QuotaExceeded, "budget exceeded"),
+        PolicyError::PaymentCapExceeded => {
+            nip47_error(ErrorCode::QuotaExceeded, "payment exceeds per-payment cap")
+        }
         PolicyError::Replayed => nip47_error(ErrorCode::RateLimited, "event replay detected"),
         PolicyError::StaleRequest => nip47_error(
             ErrorCode::Other,

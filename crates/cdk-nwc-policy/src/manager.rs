@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cdk_nostr::nwc::{NwcRequestHandler, NwcService, NwcServiceConfig};
 use fs2::FileExt;
@@ -259,12 +258,10 @@ where
         Ok(())
     }
 
-    /// Revoke a connection and stop its service if running.
+    /// Revoke a connection. The NWC service is left running so subsequent
+    /// requests receive a NIP-47 `UNAUTHORIZED` reply instead of timing out.
     pub async fn revoke(&mut self, id: &str) -> Result<(), ManagerError> {
         self.policy_handler.revoke(id)?;
-        if self.tasks.contains_key(id) {
-            self.stop(id).await?;
-        }
         Ok(())
     }
 
@@ -273,7 +270,10 @@ where
         if self.tasks.contains_key(id) {
             return Err(ManagerError::AlreadyRunning);
         }
-        let policy = self.ensure_authorized(id)?;
+        // Start revoked and expired connections too: the policy handler still
+        // rejects every request, but the running service can return a NIP-47
+        // UNAUTHORIZED reply instead of leaving the client to time out.
+        let policy = self.policy_for(id)?;
         self.refresh_records()?;
         let record = self
             .records
@@ -303,20 +303,15 @@ where
         Ok(())
     }
 
-    /// Start every active connection and return the number started.
+    /// Start every stored connection that has a policy, including revoked and
+    /// expired ones, and return the number started. Revoked/expired services
+    /// still reject every request, but they can answer with `UNAUTHORIZED`.
     pub async fn start_all(&mut self) -> Result<usize, ManagerError> {
         self.refresh_records()?;
         let policies = self.policy_handler.connections()?;
-        let now = now_secs();
         let mut ids = Vec::new();
         for record in &self.records {
-            let active = policies
-                .iter()
-                .find(|policy| policy.id == record.id)
-                .is_some_and(|policy| {
-                    !policy.revoked && policy.expires_at.is_none_or(|expires| now < expires)
-                });
-            if active {
+            if policies.iter().any(|policy| policy.id == record.id) {
                 validate_record(record)?;
                 ids.push(record.id.clone());
             }
@@ -363,17 +358,12 @@ where
         &self.policy_handler
     }
 
-    fn ensure_authorized(&self, id: &str) -> Result<ConnectionPolicy, ManagerError> {
-        let policies = self.policy_handler.connections()?;
-        let now = now_secs();
-        policies
+    fn policy_for(&self, id: &str) -> Result<ConnectionPolicy, ManagerError> {
+        self.policy_handler
+            .connections()?
             .into_iter()
-            .find(|policy| {
-                policy.id == id
-                    && !policy.revoked
-                    && policy.expires_at.is_none_or(|expires| now < expires)
-            })
-            .ok_or(ManagerError::Unauthorized)
+            .find(|policy| policy.id == id)
+            .ok_or(ManagerError::UnknownConnection)
     }
 
     fn refresh_records(&mut self) -> Result<(), ManagerError> {
@@ -406,13 +396,6 @@ impl<H> Drop for ConnectionManager<H> {
             handle.cancel.cancel();
         }
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn validate_record(

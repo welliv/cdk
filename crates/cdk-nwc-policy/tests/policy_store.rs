@@ -79,7 +79,8 @@ fn rejects_single_payment_above_cap() {
         .authorize("client-pubkey", "pay_invoice", "event-1", 8_001, 1_001)
         .expect_err("payment above single cap must be rejected");
 
-    assert!(matches!(err, PolicyError::QuotaExceeded));
+    assert!(matches!(err, PolicyError::PaymentCapExceeded));
+    assert_eq!(err.to_string(), "payment exceeds per-payment cap");
 }
 
 #[test]

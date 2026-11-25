@@ -13,7 +13,7 @@ use cdk_nostr::nwc::nip47::{
     PayInvoiceResponse,
 };
 use cdk_nostr::nwc::NwcRequestHandler;
-use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy, PolicyNwcHandler, PolicyStore};
+use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy, PolicyError, PolicyNwcHandler, PolicyStore};
 
 const DAY: u64 = 86_400;
 const INVOICE: &str = "lnbc100n1pnvpufspp5djn8hrq49r8cghwye9kqw752qjncwyfnrprhprpqk43mwcy4yfsqdq5g9kxy7fqd9h8vmmfvdjscqzzsxqyz5vqsp5uhpjt36rj75pl7jq2sshaukzfkt7uulj456s4mh7uy7l6vx7lvxs9qxpqysgqedwz08acmqwtk8g4vkwm2w78suwt2qyzz6jkkwcgrjm3r3hs6fskyhvud4fan3keru7emjm8ygqpcrwtlmhfjfmer3afs5hhwamgr4cqtactdq";
@@ -419,4 +419,92 @@ fn legacy_events_array_migrates_and_prunes() {
         .authorize_event("client-pubkey", "get_balance", "new-evt", 0, 1_200, 1_200)
         .expect("fresh");
     assert_eq!(store.seen_event_count().expect("pruned"), 1);
+}
+
+/// A payment over the per-payment cap and a payment over the period budget
+/// must be distinct errors (same NIP-47 code later, different messages).
+#[test]
+fn cap_and_budget_errors_use_distinct_messages() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut store = PolicyStore::new(dir.path().join("policy.json")).expect("store");
+    let mut cap_policy = policy();
+    cap_policy.max_single_payment_msat = Some(5_000);
+    cap_policy.budget_msat = Some(100_000);
+    cap_policy.client_pubkey = "cap-key".to_owned();
+    cap_policy.id = "cap-app".to_owned();
+    store.add_connection(cap_policy).expect("add cap policy");
+
+    let mut budget_policy = policy();
+    budget_policy.max_single_payment_msat = Some(100_000);
+    budget_policy.budget_msat = Some(5_000);
+    budget_policy.client_pubkey = "budget-key".to_owned();
+    budget_policy.id = "budget-app".to_owned();
+    store
+        .add_connection(budget_policy)
+        .expect("add budget policy");
+
+    let cap_err = store
+        .authorize("cap-key", "pay_invoice", "event-cap", 5_001, 1_001)
+        .expect_err("over cap");
+    let budget_err = store
+        .authorize("budget-key", "pay_invoice", "event-budget", 5_001, 1_001)
+        .expect_err("over budget");
+
+    assert_eq!(
+        cap_err.to_string(),
+        "payment exceeds per-payment cap",
+        "cap rejection must use a distinct message"
+    );
+    assert_eq!(budget_err.to_string(), "budget exceeded");
+    assert_ne!(
+        cap_err, budget_err,
+        "cap and budget must be distinct PolicyError variants"
+    );
+    assert!(matches!(cap_err, PolicyError::PaymentCapExceeded));
+    assert!(matches!(budget_err, PolicyError::QuotaExceeded));
+}
+
+/// The policy handler must map both variants to NIP-47 QUOTA_EXCEEDED with
+/// the distinct messages.
+#[tokio::test]
+async fn pay_invoice_cap_and_budget_share_code_but_not_message() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let cap_handler = PolicyNwcHandler::new(dir.path().join("cap.json"), Arc::new(BrokeWallet))
+        .expect("cap handler");
+    let mut cap_policy = policy();
+    cap_policy.max_single_payment_msat = Some(5_000);
+    cap_policy.budget_msat = Some(1_000_000);
+    cap_handler.add_connection(cap_policy).expect("add cap");
+    let cap_error = cap_handler
+        .pay_invoice_with_context(PayInvoiceRequest::new(INVOICE), &context("event-cap"))
+        .await
+        .expect_err("invoice plus reserve exceeds cap");
+    assert_eq!(cap_error.code, ErrorCode::QuotaExceeded);
+    assert_eq!(cap_error.message, "payment exceeds per-payment cap");
+
+    let budget_handler =
+        PolicyNwcHandler::new(dir.path().join("budget.json"), Arc::new(BrokeWallet))
+            .expect("budget handler");
+    let mut budget_policy = policy();
+    budget_policy.max_single_payment_msat = Some(1_000_000);
+    budget_policy.budget_msat = Some(5_000);
+    budget_handler
+        .add_connection(budget_policy)
+        .expect("add budget");
+    let budget_error = budget_handler
+        .pay_invoice_with_context(PayInvoiceRequest::new(INVOICE), &context("event-budget"))
+        .await
+        .expect_err("invoice plus reserve exceeds budget");
+    assert_eq!(budget_error.code, ErrorCode::QuotaExceeded);
+    assert_eq!(budget_error.message, "budget exceeded");
+}
+
+fn context(event: &str) -> RequestContext {
+    RequestContext {
+        event_id: event.to_owned(),
+        client_pubkey: "client-pubkey".to_owned(),
+        created_at: 1_001,
+        received_at: 1_001,
+    }
 }

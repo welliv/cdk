@@ -9,7 +9,7 @@ use cdk_nostr::nwc::nip47::{
     PayInvoiceResponse,
 };
 use cdk_nostr::nwc::NwcRequestHandler;
-use cdk_nwc_policy::manager::{ConnectionManager, ManagerError};
+use cdk_nwc_policy::manager::ConnectionManager;
 use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy};
 
 struct MockWallet;
@@ -138,33 +138,6 @@ fn manager_state_survives_restart() {
 }
 
 #[tokio::test]
-async fn start_rejects_revoked_connection() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let mut manager = ConnectionManager::new(
-        dir.path().join("manager.json"),
-        dir.path().join("policy.json"),
-        Arc::new(MockWallet),
-    )
-    .expect("manager");
-    manager
-        .create_connection(
-            "Revoked app".to_owned(),
-            vec!["ws://127.0.0.1:1234".to_owned()],
-            policy(),
-        )
-        .expect("create connection");
-    let id = manager.list_connections()[0].id.clone();
-
-    manager.revoke(&id).await.expect("revoke");
-
-    let error = manager
-        .start(&id)
-        .await
-        .expect_err("revoked must not start");
-    assert!(matches!(error, ManagerError::Unauthorized));
-}
-
-#[tokio::test]
 async fn revoke_marks_policy_revoked() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut manager = ConnectionManager::new(
@@ -185,4 +158,93 @@ async fn revoke_marks_policy_revoked() {
     manager.revoke(&id).await.expect("revoke");
 
     assert!(manager.policy_handler().connections().expect("policies")[0].revoked);
+}
+
+#[tokio::test]
+async fn start_all_starts_revoked_and_expired_connections() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut manager = ConnectionManager::new(
+        dir.path().join("manager.json"),
+        dir.path().join("policy.json"),
+        Arc::new(MockWallet),
+    )
+    .expect("manager");
+
+    manager
+        .create_connection(
+            "Active app".to_owned(),
+            vec!["ws://127.0.0.1:1234".to_owned()],
+            policy(),
+        )
+        .expect("create active");
+    manager
+        .create_connection(
+            "Revoked app".to_owned(),
+            vec!["ws://127.0.0.1:1235".to_owned()],
+            policy(),
+        )
+        .expect("create revoked");
+    let mut expired_policy = policy();
+    expired_policy.expires_at = Some(1);
+    manager
+        .create_connection(
+            "Expired app".to_owned(),
+            vec!["ws://127.0.0.1:1236".to_owned()],
+            expired_policy,
+        )
+        .expect("create expired");
+
+    let revoked_id = manager
+        .list_connections()
+        .iter()
+        .find(|r| r.name == "Revoked app")
+        .expect("revoked")
+        .id
+        .clone();
+    manager.revoke(&revoked_id).await.expect("revoke");
+
+    let started = manager.start_all().await.expect("start_all");
+    assert_eq!(
+        started, 3,
+        "revoked and expired connections must be started so they can reply UNAUTHORIZED"
+    );
+    assert_eq!(manager.active_count(), 3);
+}
+
+#[tokio::test]
+async fn start_and_revoke_keep_service_running_to_reject_requests() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut manager = ConnectionManager::new(
+        dir.path().join("manager.json"),
+        dir.path().join("policy.json"),
+        Arc::new(MockWallet),
+    )
+    .expect("manager");
+    manager
+        .create_connection(
+            "Soon revoked".to_owned(),
+            vec!["ws://127.0.0.1:1234".to_owned()],
+            policy(),
+        )
+        .expect("create");
+    let id = manager.list_connections()[0].id.clone();
+
+    manager.start(&id).await.expect("start");
+    assert_eq!(manager.active_count(), 1);
+
+    manager.revoke(&id).await.expect("revoke");
+    assert!(manager.policy_handler().connections().expect("policies")[0].revoked);
+    assert_eq!(
+        manager.active_count(),
+        1,
+        "revoking must leave the service running so clients get UNAUTHORIZED, not a timeout"
+    );
+
+    // Starting a connection that is already revoked must also work (e.g. after restart).
+    manager.stop(&id).await.expect("stop");
+    manager
+        .start(&id)
+        .await
+        .expect("revoked connection must still start so it can reply UNAUTHORIZED");
+    assert_eq!(manager.active_count(), 1);
 }
