@@ -23,8 +23,13 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+cdk-nwc-forward = { path = "../cdk-nwc-forward" }
+cdk-sqlite = { workspace = true, features = ["wallet"] }
+nostr = { workspace = true }
+tokio-util = { workspace = true }
+tracing-subscriber = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

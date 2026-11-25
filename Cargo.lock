@@ -1748,14 +1748,19 @@ dependencies = [
  "bitcoin",
  "cdk",
  "cdk-nostr",
+ "cdk-nwc-forward",
+ "cdk-sqlite",
  "fs2",
  "lightning-invoice",
+ "nostr",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
