@@ -1,0 +1,30 @@
+[package]
+name = "cdk-nwc-pocket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Per-connection Cashu pockets that bound what an NWC link can spend"
+
+[dependencies]
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+cdk = { workspace = true, features = ["wallet", "nwc"] }
+cdk-nostr = { workspace = true, features = ["nwc"] }
+fs2 = "0.4"
+lightning-invoice = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

@@ -1560,6 +1560,7 @@ dependencies = [
  "cdk-mintd",
  "cdk-nostr",
  "cdk-nwc-forward",
+ "cdk-nwc-pocket",
  "cdk-nwc-policy",
  "cdk-nwc-policy-cli",
  "cdk-postgres",
@@ -1581,6 +1582,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
@@ -1736,6 +1738,24 @@ dependencies = [
  "async-trait",
  "cdk-nostr",
  "nwc",
+]
+
+[[package]]
+name = "cdk-nwc-pocket"
+version = "0.18.0"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "cdk",
+ "cdk-nostr",
+ "fs2",
+ "lightning-invoice",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

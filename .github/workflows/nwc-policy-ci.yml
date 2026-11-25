@@ -19,7 +19,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy -p cdk-nostr -p cdk-nwc-policy -p cdk-nwc-forward -p cdk-nwc-policy-cli --all-targets -- -D warnings
+        run: cargo clippy -p cdk-nostr -p cdk-nwc-policy -p cdk-nwc-forward -p cdk-nwc-policy-cli -p cdk-nwc-pocket --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test -p cdk-nostr -p cdk-nwc-policy -p cdk-nwc-forward -p cdk-nwc-policy-cli --no-fail-fast
+        run: cargo test -p cdk-nostr -p cdk-nwc-policy -p cdk-nwc-forward -p cdk-nwc-policy-cli -p cdk-nwc-pocket --no-fail-fast
