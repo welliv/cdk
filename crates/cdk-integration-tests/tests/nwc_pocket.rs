@@ -348,3 +348,136 @@ async fn refill_cap_survives_manual_top_up() {
         .await
         .is_err());
 }
+
+/// The `serve` maintenance pass sweeps a revoked or expired pocket home and
+/// rebalances an open one above its ceiling.
+#[tokio::test]
+async fn maintenance_sweeps_closed_pockets_and_rebalances_open_ones() {
+    use std::collections::HashMap;
+
+    use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy};
+    use cdk_nwc_policy_cli::pocket::maintain_pockets;
+
+    setup_tracing();
+    let mint = create_and_start_in_memory_test_mint().await.expect("mint");
+    let s = setup(Arc::clone(&mint), 500, 100, RefillPolicy::default()).await;
+    let open_pocket = wallet_on(&mint, random_seed()).await;
+    s.registry
+        .add(PocketConfig {
+            connection_id: "open".to_owned(),
+            index: 1,
+            ceiling_msat: 50 * SAT,
+            refill: RefillPolicy::default(),
+            swept_at: None,
+        })
+        .expect("add");
+    fund_wallet(&open_pocket, 120, None).await.expect("fund");
+
+    let policy = |id: &str, expires_at: Option<u64>| ConnectionPolicy {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        client_pubkey: id.to_owned(),
+        allowed_methods: vec!["pay_invoice".to_owned()],
+        budget_msat: None,
+        budget_period: BudgetPeriod::Never,
+        max_single_payment_msat: None,
+        max_fee_reserve_msat: 0,
+        fee_overage_msat: 0,
+        expires_at,
+        revoked: false,
+        used_msat: 0,
+        period_start_secs: 0,
+    };
+    let t = now();
+    let policies = vec![policy("agent", Some(t - 1)), policy("open", None)];
+    let mut pockets = HashMap::new();
+    pockets.insert(
+        "agent".to_owned(),
+        Arc::new(
+            PocketNwcHandler::new("agent".to_owned(), Arc::clone(&s.pocket), None)
+                .expect("handler"),
+        ),
+    );
+    pockets.insert(
+        "open".to_owned(),
+        Arc::new(
+            PocketNwcHandler::new("open".to_owned(), Arc::clone(&open_pocket), None)
+                .expect("handler"),
+        ),
+    );
+
+    let main_before = sats(&s.main).await;
+    maintain_pockets(&s.main, &s.registry, &policies, &pockets, t)
+        .await
+        .expect("maintenance");
+
+    assert_eq!(sats(&s.pocket).await, 0, "expired pocket swept");
+    assert!(s.registry.get("agent").expect("get").swept_at.is_some());
+    assert!(
+        sats(&open_pocket).await <= 50,
+        "open pocket trimmed to ceiling"
+    );
+    assert!(s.registry.get("open").expect("get").swept_at.is_none());
+    assert!(sats(&s.main).await > main_before + 150);
+}
+
+/// The policy layer in front of a pocket still blocks replays and revoked
+/// links (pocket + ledger, not pocket instead of ledger).
+#[tokio::test]
+async fn policy_over_pocket_keeps_replay_protection_and_revoke() {
+    use cdk_nostr::nwc::handler::RequestContext;
+    use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy, PolicyNwcHandler};
+
+    setup_tracing();
+    let mint = create_and_start_in_memory_test_mint().await.expect("mint");
+    let s = setup(mint, 500, 100, RefillPolicy::default()).await;
+    let pocket = Arc::new(
+        PocketNwcHandler::new("agent".to_owned(), Arc::clone(&s.pocket), None).expect("handler"),
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy = PolicyNwcHandler::new(dir.path().join("policy.json"), pocket).expect("policy");
+    let t = now();
+    policy
+        .add_connection(ConnectionPolicy {
+            id: "agent".to_owned(),
+            name: "agent".to_owned(),
+            client_pubkey: "client".to_owned(),
+            allowed_methods: vec!["pay_invoice".to_owned()],
+            budget_msat: None,
+            budget_period: BudgetPeriod::Never,
+            max_single_payment_msat: None,
+            max_fee_reserve_msat: 0,
+            fee_overage_msat: 0,
+            expires_at: None,
+            revoked: false,
+            used_msat: 0,
+            period_start_secs: t,
+        })
+        .expect("add");
+    let ctx = |event: &str| RequestContext {
+        event_id: event.to_owned(),
+        client_pubkey: "client".to_owned(),
+        created_at: t,
+        received_at: t,
+    };
+
+    let request = invoice(10);
+    policy
+        .pay_invoice_with_context(request.clone(), &ctx("e1"))
+        .await
+        .expect("first pay");
+    let after_first = sats(&s.pocket).await;
+    policy
+        .pay_invoice_with_context(request, &ctx("e1"))
+        .await
+        .expect_err("replayed event must be rejected");
+    assert_eq!(sats(&s.pocket).await, after_first);
+
+    policy.revoke("agent").expect("revoke");
+    let error = policy
+        .pay_invoice_with_context(invoice(5), &ctx("e2"))
+        .await
+        .expect_err("revoked");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert_eq!(sats(&s.pocket).await, after_first);
+}
