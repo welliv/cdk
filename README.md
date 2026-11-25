@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Nut November submission:** this fork's `feat/nwc-policy-submission` branch adds a per-connection policy layer for CDK's Cashu-backed NWC service: budgets, method allowlists, fee reserves, expiry, revocation and replay protection. See [SUBMISSION.md](SUBMISSION.md) and [test evidence](docs/nwc-policy/TEST_EVIDENCE.md).
+
 > [!Warning]
 > This project is in early development, it does however work with real sats! Always use amounts you don't mind losing.
 
