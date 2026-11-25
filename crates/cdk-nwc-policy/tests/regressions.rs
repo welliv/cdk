@@ -240,6 +240,70 @@ async fn insufficient_balance_releases_reservation() {
     assert_eq!(handler.used_msat("app-1"), Some(0));
 }
 
+/// Wallet whose pocket refill cap is used up.
+struct CappedPocket;
+
+#[async_trait]
+impl NwcRequestHandler for CappedPocket {
+    async fn get_info(&self) -> Result<GetInfoResponse, NIP47Error> {
+        Err(err(ErrorCode::Internal, "unused"))
+    }
+    async fn get_balance(&self) -> Result<GetBalanceResponse, NIP47Error> {
+        Ok(GetBalanceResponse { balance: 0 })
+    }
+    async fn make_invoice(
+        &self,
+        _request: MakeInvoiceRequest,
+    ) -> Result<MakeInvoiceResponse, NIP47Error> {
+        Err(err(ErrorCode::Internal, "unused"))
+    }
+    async fn pay_invoice(
+        &self,
+        _request: PayInvoiceRequest,
+    ) -> Result<PayInvoiceResponse, NIP47Error> {
+        Err(err(ErrorCode::QuotaExceeded, "pocket refill cap reached"))
+    }
+    async fn lookup_invoice(
+        &self,
+        _request: LookupInvoiceRequest,
+    ) -> Result<LookupInvoiceResponse, NIP47Error> {
+        Err(err(ErrorCode::Internal, "unused"))
+    }
+    async fn list_transactions(
+        &self,
+        _request: ListTransactionsRequest,
+    ) -> Result<Vec<LookupInvoiceResponse>, NIP47Error> {
+        Err(err(ErrorCode::Internal, "unused"))
+    }
+}
+
+/// A pocket that hit its refill cap answers QUOTA_EXCEEDED before paying
+/// anything, so the policy reservation must be released, not charged.
+#[tokio::test]
+async fn inner_quota_exceeded_releases_reservation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let handler =
+        PolicyNwcHandler::new(dir.path().join("policy.json"), Arc::new(CappedPocket)).expect("h");
+    let mut policy = policy();
+    policy.budget_msat = Some(INVOICE_MSAT * 3);
+    handler.add_connection(policy).expect("add");
+
+    for i in 0..5 {
+        let ctx = RequestContext {
+            event_id: format!("event-{i}"),
+            client_pubkey: "client-pubkey".to_owned(),
+            created_at: 1_001,
+            received_at: 1_001,
+        };
+        let error = handler
+            .pay_invoice_with_context(PayInvoiceRequest::new(INVOICE), &ctx)
+            .await
+            .expect_err("cap reached");
+        assert_eq!(error.code, ErrorCode::QuotaExceeded);
+    }
+    assert_eq!(handler.used_msat("app-1"), Some(0));
+}
+
 #[test]
 fn concurrent_create_connection_preserves_other_process_records() {
     let dir = tempfile::tempdir().expect("temp dir");

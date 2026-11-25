@@ -683,6 +683,18 @@ where
         })
     }
 
+    /// A handler that enforces the same policy ledger in front of a different
+    /// inner handler, e.g. a per-connection pocket wallet.
+    pub fn with_inner<I>(&self, inner: Arc<I>) -> PolicyNwcHandler<I>
+    where
+        I: NwcRequestHandler,
+    {
+        PolicyNwcHandler {
+            store: Arc::clone(&self.store),
+            inner,
+        }
+    }
+
     /// Add or replace a connection policy.
     pub fn add_connection(&self, policy: ConnectionPolicy) -> Result<(), PolicyError> {
         self.store
@@ -906,11 +918,17 @@ where
                 self.finish(&auth, actual)?;
                 Ok(response)
             }
-            Err(error) if error.code == ErrorCode::InsufficientBalance => {
-                // Insufficient balance is decided before any payment is
-                // dispatched, so nothing can have been spent. Release the
-                // reservation; charging it would let failed attempts drain
-                // the budget without moving funds.
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::InsufficientBalance | ErrorCode::QuotaExceeded
+                ) =>
+            {
+                // Insufficient balance and an inner quota (e.g. a pocket's
+                // refill cap) are decided before any payment is dispatched,
+                // so nothing can have been spent. Release the reservation;
+                // charging it would let failed attempts drain the budget
+                // without moving funds.
                 self.cancel(&auth);
                 Err(error)
             }

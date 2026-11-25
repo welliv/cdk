@@ -267,6 +267,36 @@ where
 
     /// Start one NWC service for a stored connection.
     pub async fn start(&mut self, id: &str) -> Result<(), ManagerError> {
+        let handler = self.policy_handler.clone();
+        self.start_handler(id, handler).await
+    }
+
+    /// Start one NWC service whose requests reach `inner` instead of the
+    /// manager's shared handler, still behind the same policy ledger.
+    ///
+    /// Use this to give a connection its own wallet (a pocket), so it cannot
+    /// reach funds outside it even if the ledger were wrong.
+    pub async fn start_with_inner<I>(&mut self, id: &str, inner: Arc<I>) -> Result<(), ManagerError>
+    where
+        I: NwcRequestHandler + Send + Sync + 'static,
+    {
+        let handler = Arc::new(self.policy_handler.with_inner(inner));
+        self.start_handler(id, handler).await
+    }
+
+    /// Whether a service for `id` is running in this manager.
+    pub fn is_running(&self, id: &str) -> bool {
+        self.tasks.contains_key(id)
+    }
+
+    async fn start_handler<I>(
+        &mut self,
+        id: &str,
+        handler: Arc<PolicyNwcHandler<I>>,
+    ) -> Result<(), ManagerError>
+    where
+        I: NwcRequestHandler + Send + Sync + 'static,
+    {
         if self.tasks.contains_key(id) {
             return Err(ManagerError::AlreadyRunning);
         }
@@ -293,7 +323,6 @@ where
         .with_allowed_methods(policy.allowed_methods);
 
         let cancel = CancellationToken::new();
-        let handler = self.policy_handler.clone();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             let _ = service.run(handler, task_cancel).await;
