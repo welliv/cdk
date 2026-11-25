@@ -1770,6 +1770,7 @@ dependencies = [
  "clap",
  "hex",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

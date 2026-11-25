@@ -62,6 +62,16 @@ pub async fn create_and_start_in_memory_test_mint() -> Result<Arc<Mint>> {
     .await
 }
 
+/// Start an in-memory pure test mint with an explicit `input_fee_ppk`.
+pub async fn create_and_start_in_memory_test_mint_with_fee(fee_ppk: u64) -> Result<Arc<Mint>> {
+    build_and_start_mint(
+        Arc::new(cdk_sqlite::mint::memory::empty().await?),
+        None,
+        Some(fee_ppk),
+    )
+    .await
+}
+
 /// Select the mint store from `CDK_TEST_DB_TYPE` (`memory` or a temp SQLite file).
 async fn env_localstore() -> Result<Arc<cdk_sqlite::MintSqliteDatabase>> {
     let db_type = env::var("CDK_TEST_DB_TYPE").expect("Database type set");

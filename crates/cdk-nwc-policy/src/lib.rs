@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cdk_nostr::nwc::handler::{NwcRequestHandler, RequestContext};
@@ -33,13 +34,16 @@ use thiserror::Error;
 pub enum BudgetPeriod {
     /// Budget never resets automatically.
     Never,
-    /// Budget resets every day.
+    /// Budget resets every 24 hours (`86_400` seconds).
     Daily,
-    /// Budget resets every week.
+    /// Budget resets every 7 days (`604_800` seconds).
     Weekly,
-    /// Budget resets every 30 days.
+    /// Budget resets every fixed 30-day window (`2_592_000` seconds), measured
+    /// from the first request after the previous window ended rather than
+    /// calendar month boundaries.
     Monthly,
-    /// Budget resets every 365 days.
+    /// Budget resets every fixed 365-day window (`31_536_000` seconds), measured
+    /// from the first request after the previous window ended.
     Yearly,
 }
 
@@ -86,6 +90,15 @@ pub struct ConnectionPolicy {
     pub period_start_secs: u64,
 }
 
+/// Default replay acceptance window in seconds (matches `cdk_nostr` request age).
+pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 3_600;
+
+/// Default allowed future clock skew for request `created_at` timestamps.
+pub const DEFAULT_MAX_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Default time-to-live for unresolved in-flight reservations before crash recovery.
+pub const DEFAULT_RESERVATION_TTL_SECS: u64 = 300;
+
 /// A reserved spend authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authorization {
@@ -97,6 +110,9 @@ pub struct Authorization {
     pub period_start_secs: u64,
     /// Reserved amount in millisatoshis.
     pub amount_msat: u64,
+    /// Unix timestamp when this authorization was created.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 /// Policy enforcement errors.
@@ -117,6 +133,9 @@ pub enum PolicyError {
     /// The Nostr event ID has already been processed.
     #[error("event replay detected")]
     Replayed,
+    /// The request event timestamp is outside the acceptance window.
+    #[error("request timestamp outside acceptance window")]
+    StaleRequest,
     /// The authorization ID is unknown.
     #[error("authorization not found")]
     UnknownAuthorization,
@@ -134,10 +153,21 @@ pub enum PolicyError {
     Serde(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SeenEvent {
+    id: String,
+    retain_until: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PolicyFile {
     connections: Vec<ConnectionPolicy>,
+    /// Legacy unbounded event ID list; migrated into `seen_events` on write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     events: Vec<String>,
+    #[serde(default)]
+    seen_events: Vec<SeenEvent>,
+    #[serde(default)]
     reservations: Vec<Authorization>,
 }
 
@@ -146,6 +176,9 @@ struct PolicyFile {
 pub struct PolicyStore {
     path: PathBuf,
     lock_path: PathBuf,
+    replay_window_secs: u64,
+    max_future_skew_secs: u64,
+    reservation_ttl_secs: u64,
 }
 
 impl PolicyStore {
@@ -171,7 +204,47 @@ impl PolicyStore {
         let file = read_file(&path)?;
         validate_connections(&file)?;
         drop(lock);
-        Ok(Self { path, lock_path })
+        Ok(Self {
+            path,
+            lock_path,
+            replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
+            max_future_skew_secs: DEFAULT_MAX_FUTURE_SKEW_SECS,
+            reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
+        })
+    }
+
+    /// Override the replay acceptance and retention window (in seconds).
+    #[must_use]
+    pub fn with_replay_window(mut self, window_secs: u64) -> Self {
+        self.replay_window_secs = window_secs;
+        self
+    }
+
+    /// Override the TTL (in seconds) after which unresolved reservations expire.
+    #[must_use]
+    pub fn with_reservation_ttl(mut self, ttl_secs: u64) -> Self {
+        self.reservation_ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Number of currently retained replay-protection event records.
+    pub fn seen_event_count(&self) -> Result<usize, PolicyError> {
+        self.read(|file| Ok(file.events.len().saturating_add(file.seen_events.len())))
+    }
+
+    /// Number of currently open reservations.
+    pub fn reservation_count(&self) -> Result<usize, PolicyError> {
+        self.read(|file| Ok(file.reservations.len()))
+    }
+
+    /// Settle and remove unresolved reservations older than the configured TTL.
+    ///
+    /// Expired spend reservations keep their reserved amount charged in their
+    /// own period (fail-closed) so a crash cannot bypass budgets, while removing
+    /// them prevents permanently bricking future periods.
+    pub fn expire_stale_reservations(&mut self, now: u64) -> Result<usize, PolicyError> {
+        let ttl = self.reservation_ttl_secs;
+        self.mutate(|file| Ok(expire_stale_reservations_in_file(file, now, ttl)))
     }
 
     /// Add or replace a connection policy.
@@ -216,6 +289,23 @@ impl PolicyStore {
         amount_msat: u64,
         now: u64,
     ) -> Result<Authorization, PolicyError> {
+        self.authorize_event(client_pubkey, method, event_id, amount_msat, now, now)
+    }
+
+    /// Authorize a request with an explicit event `created_at` timestamp,
+    /// enforcing the replay acceptance window and pruning expired replay IDs.
+    pub fn authorize_event(
+        &mut self,
+        client_pubkey: &str,
+        method: &str,
+        event_id: &str,
+        amount_msat: u64,
+        created_at: u64,
+        now: u64,
+    ) -> Result<Authorization, PolicyError> {
+        let replay_window_secs = self.replay_window_secs;
+        let max_future_skew_secs = self.max_future_skew_secs;
+        let reservation_ttl_secs = self.reservation_ttl_secs;
         self.mutate(|file| {
             let index = file
                 .connections
@@ -238,7 +328,15 @@ impl PolicyStore {
             {
                 return Err(PolicyError::Restricted(method.to_owned()));
             }
-            if file.events.iter().any(|seen| seen == event_id) {
+
+            if created_at < now.saturating_sub(replay_window_secs)
+                || created_at > now.saturating_add(max_future_skew_secs)
+            {
+                return Err(PolicyError::StaleRequest);
+            }
+
+            migrate_and_prune_seen_events(file, now, replay_window_secs);
+            if file.seen_events.iter().any(|seen| seen.id == event_id) {
                 return Err(PolicyError::Replayed);
             }
             if let Some(cap) = file.connections[index].max_single_payment_msat {
@@ -247,6 +345,9 @@ impl PolicyStore {
                 }
             }
 
+            // Expire crashed/abandoned reservations in their own period before
+            // evaluating rollover so they never brick future periods.
+            expire_stale_reservations_in_file(file, now, reservation_ttl_secs);
             rollover_if_needed(file, index, now);
 
             if let Some(budget) = file.connections[index].budget_msat {
@@ -264,13 +365,19 @@ impl PolicyStore {
             file.connections[index].used_msat = file.connections[index]
                 .used_msat
                 .saturating_add(amount_msat);
-            file.events.push(event_id.to_owned());
+            file.seen_events.push(SeenEvent {
+                id: event_id.to_owned(),
+                retain_until: created_at
+                    .saturating_add(replay_window_secs)
+                    .saturating_add(1),
+            });
 
             let authorization = Authorization {
                 id: format!("{}:{}", connection_id, event_id),
                 connection_id,
                 period_start_secs,
                 amount_msat,
+                created_at: now,
             };
             file.reservations.push(authorization.clone());
             Ok(authorization)
@@ -418,10 +525,34 @@ fn adjust_used(
         .find(|existing| existing.id == connection_id)
     {
         if policy.period_start_secs == period_start_secs {
-            policy.used_msat = policy.used_msat.saturating_sub(reserved - actual);
+            policy.used_msat = policy
+                .used_msat
+                .saturating_sub(reserved.saturating_sub(actual));
         }
         policy.fee_overage_msat = policy.fee_overage_msat.saturating_add(overage);
     }
+}
+
+fn migrate_and_prune_seen_events(file: &mut PolicyFile, now: u64, replay_window_secs: u64) {
+    if !file.events.is_empty() {
+        let legacy_retain_until = now.saturating_add(replay_window_secs).saturating_add(1);
+        for id in file.events.drain(..) {
+            if !file.seen_events.iter().any(|seen| seen.id == id) {
+                file.seen_events.push(SeenEvent {
+                    id,
+                    retain_until: legacy_retain_until,
+                });
+            }
+        }
+    }
+    file.seen_events.retain(|seen| seen.retain_until > now);
+}
+
+fn expire_stale_reservations_in_file(file: &mut PolicyFile, now: u64, ttl_secs: u64) -> usize {
+    let before = file.reservations.len();
+    file.reservations
+        .retain(|reservation| now < reservation.created_at.saturating_add(ttl_secs));
+    before.saturating_sub(file.reservations.len())
 }
 
 fn rollover_if_needed(file: &mut PolicyFile, index: usize, now: u64) {
@@ -508,6 +639,10 @@ fn map_policy_error(error: PolicyError) -> NIP47Error {
         ),
         PolicyError::QuotaExceeded => nip47_error(ErrorCode::QuotaExceeded, "budget exceeded"),
         PolicyError::Replayed => nip47_error(ErrorCode::RateLimited, "event replay detected"),
+        PolicyError::StaleRequest => nip47_error(
+            ErrorCode::Other,
+            "request timestamp outside acceptance window",
+        ),
         other => nip47_error(ErrorCode::Internal, &other.to_string()),
     }
 }
@@ -534,8 +669,10 @@ where
 {
     /// Create a policy handler backed by a persistent ledger at `path`.
     pub fn new<P: AsRef<Path>>(path: P, inner: Arc<H>) -> Result<Self, PolicyError> {
+        let mut store = PolicyStore::new(path)?;
+        let _ = store.expire_stale_reservations(now_secs());
         Ok(Self {
-            store: Arc::new(Mutex::new(PolicyStore::new(path)?)),
+            store: Arc::new(Mutex::new(store)),
             inner,
         })
     }
@@ -585,11 +722,12 @@ where
             .lock()
             .map_err(|_| nip47_error(ErrorCode::Internal, "policy lock poisoned"))?;
         store
-            .authorize(
+            .authorize_event(
                 &ctx.client_pubkey,
                 method,
                 &ctx.event_id,
                 amount_msat,
+                ctx.created_at,
                 ctx.received_at,
             )
             .map_err(map_policy_error)
@@ -818,4 +956,11 @@ where
             }
         }
     }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

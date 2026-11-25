@@ -18,7 +18,10 @@ use cdk_nostr::nwc::{NwcRequestHandler, SUPPORTED_METHODS};
 use cdk_nwc_forward::ForwardingNwcHandler;
 use cdk_nwc_policy::manager::ConnectionManager;
 use cdk_nwc_policy::ConnectionPolicy;
-use cdk_nwc_policy_cli::{parse_budget_period, resolve_expiry, spawn_quote_claimer};
+use cdk_nwc_policy_cli::{
+    ensure_private_file, parse_budget_period, resolve_expiry, restrict_sqlite_sidecars,
+    spawn_quote_claimer,
+};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -227,9 +230,11 @@ async fn build_manager(
             .as_ref()
             .context("--wallet-db is required without --upstream-nwc-uri-file")?;
         let seed = resolve_seed(wallet)?;
+        ensure_private_file(wallet_db)?;
         let database = cdk_sqlite::WalletSqliteDatabase::new(wallet_db)
             .await
             .context("open wallet database")?;
+        restrict_sqlite_sidecars(wallet_db)?;
         let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, Arc::new(database), seed, None)
             .context("build CDK wallet")?;
         let wallet = Arc::new(wallet);
@@ -246,12 +251,17 @@ async fn build_manager(
 }
 
 fn policy_from_args(args: &CreateArgs) -> Result<ConnectionPolicy> {
-    let allowed_methods: Vec<String> = args
+    let mut allowed_methods = Vec::new();
+    for method in args
         .methods
         .split(',')
-        .map(|method| method.trim().to_owned())
+        .map(str::trim)
         .filter(|method| !method.is_empty())
-        .collect();
+    {
+        if !allowed_methods.iter().any(|seen| seen == method) {
+            allowed_methods.push(method.to_owned());
+        }
+    }
     if allowed_methods.is_empty() {
         bail!("at least one method is required");
     }

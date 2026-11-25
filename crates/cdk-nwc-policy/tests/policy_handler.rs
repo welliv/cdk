@@ -90,6 +90,7 @@ fn context(event: &str) -> RequestContext {
     RequestContext {
         event_id: event.to_owned(),
         client_pubkey: "client-key".to_owned(),
+        created_at: 1_001,
         received_at: 1_001,
     }
 }
@@ -206,6 +207,7 @@ async fn rejects_unknown_client() {
         .get_balance_with_context(&RequestContext {
             event_id: "event-1".to_owned(),
             client_pubkey: "unknown".to_owned(),
+            created_at: 1_001,
             received_at: 1_001,
         })
         .await

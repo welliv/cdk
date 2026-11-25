@@ -188,7 +188,8 @@ where
             relays: parsed_relays,
             lud16: None,
         })
-        .map_err(|error| ManagerError::Nwc(error.to_string()))?;
+        .map_err(|error| ManagerError::Nwc(error.to_string()))?
+        .with_allowed_methods(policy.allowed_methods.clone());
 
         let record = ConnectionRecord {
             id: id.clone(),
@@ -202,14 +203,16 @@ where
         };
         let uri = service.connection_uri().to_string();
 
-        self.records.push(record.clone());
-        if let Err(error) = self.persist() {
-            self.records.retain(|existing| existing.id != id);
-            return Err(error);
-        }
+        // Locked read-modify-write so concurrent `create_connection` calls from
+        // separate processes cannot overwrite each other's records.
+        self.mutate_records(|records| {
+            records.retain(|existing| existing.id != id);
+            records.push(record.clone());
+        })?;
         if let Err(error) = self.policy_handler.add_connection(policy) {
-            self.records.retain(|existing| existing.id != id);
-            let _ = self.persist();
+            let _ = self.mutate_records(|records| {
+                records.retain(|existing| existing.id != id);
+            });
             return Err(error.into());
         }
         Ok(uri)
@@ -270,7 +273,8 @@ where
         if self.tasks.contains_key(id) {
             return Err(ManagerError::AlreadyRunning);
         }
-        self.ensure_authorized(id)?;
+        let policy = self.ensure_authorized(id)?;
+        self.refresh_records()?;
         let record = self
             .records
             .iter()
@@ -285,7 +289,8 @@ where
             relays,
             lud16: None,
         })
-        .map_err(|error| ManagerError::Nwc(error.to_string()))?;
+        .map_err(|error| ManagerError::Nwc(error.to_string()))?
+        .with_allowed_methods(policy.allowed_methods);
 
         let cancel = CancellationToken::new();
         let handler = self.policy_handler.clone();
@@ -300,6 +305,7 @@ where
 
     /// Start every active connection and return the number started.
     pub async fn start_all(&mut self) -> Result<usize, ManagerError> {
+        self.refresh_records()?;
         let policies = self.policy_handler.connections()?;
         let now = now_secs();
         let mut ids = Vec::new();
@@ -357,30 +363,40 @@ where
         &self.policy_handler
     }
 
-    fn ensure_authorized(&self, id: &str) -> Result<(), ManagerError> {
+    fn ensure_authorized(&self, id: &str) -> Result<ConnectionPolicy, ManagerError> {
         let policies = self.policy_handler.connections()?;
         let now = now_secs();
-        let active = policies
-            .iter()
-            .find(|policy| policy.id == id)
-            .is_some_and(|policy| {
-                !policy.revoked && policy.expires_at.is_none_or(|expires| now < expires)
-            });
-        if active {
-            Ok(())
-        } else {
-            Err(ManagerError::Unauthorized)
-        }
+        policies
+            .into_iter()
+            .find(|policy| {
+                policy.id == id
+                    && !policy.revoked
+                    && policy.expires_at.is_none_or(|expires| now < expires)
+            })
+            .ok_or(ManagerError::Unauthorized)
     }
 
-    fn persist(&self) -> Result<(), ManagerError> {
+    fn refresh_records(&mut self) -> Result<(), ManagerError> {
         let lock = open_lock(&self.lock_path)?;
         lock.lock_exclusive()
             .map_err(|error| ManagerError::Io(error.to_string()))?;
-        let file = ManagerFile {
-            connections: self.records.clone(),
-        };
-        write_manager_file(&self.manager_path, &file)
+        let file = read_manager_file(&self.manager_path)?;
+        self.records = file.connections;
+        Ok(())
+    }
+
+    fn mutate_records(
+        &mut self,
+        operation: impl FnOnce(&mut Vec<ConnectionRecord>),
+    ) -> Result<(), ManagerError> {
+        let lock = open_lock(&self.lock_path)?;
+        lock.lock_exclusive()
+            .map_err(|error| ManagerError::Io(error.to_string()))?;
+        let mut file = read_manager_file(&self.manager_path)?;
+        operation(&mut file.connections);
+        write_manager_file(&self.manager_path, &file)?;
+        self.records = file.connections;
+        Ok(())
     }
 }
 

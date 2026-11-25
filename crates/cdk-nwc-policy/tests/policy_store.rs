@@ -225,7 +225,13 @@ fn stale_reservation_is_carried_and_release_frees_new_period() {
     store.add_connection(policy).expect("add connection");
 
     let first = store
-        .authorize("client-pubkey", "pay_invoice", "event-1", 8_000, 1_001)
+        .authorize(
+            "client-pubkey",
+            "pay_invoice",
+            "event-1",
+            8_000,
+            1_000 + 86_400 - 10,
+        )
         .expect("first period payment");
     let blocked = store
         .authorize(

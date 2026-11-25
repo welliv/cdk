@@ -529,10 +529,56 @@ impl cdk_nostr::nwc::NwcRequestHandler for WalletNwcHandler {
             .await
             .map_err(|e| melt_error(&e))?;
 
+        // `FinalizedMelt::fee_paid()` only measures the melt itself and omits
+        // the input fee burned by a pre-melt proof swap. Capture `swap_fee`
+        // before confirming so `fees_paid` reflects the full wallet balance
+        // delta.
+        let swap_fee = if prepared.requires_swap() {
+            prepared.swap_fee()
+        } else {
+            Amount::ZERO
+        };
+
         let finalized = prepared.confirm().await.map_err(|e| melt_error(&e))?;
 
-        let preimage = finalized.payment_proof().unwrap_or_default().to_string();
-        let fees_paid = amount_to_msat(finalized.fee_paid(), &self.wallet.unit)?;
+        // Follow NIP-47: never trust an unverified empty preimage. When the
+        // melt response lacks a preimage or is not `Paid`, query the mint's
+        // melt quote status to recover any preimage and confirm settlement.
+        //
+        // Same-mint internal Cashu settlements (e.g. Nutshell 0.21.0 or
+        // `cdk-fake-wallet`) settle as `Paid` with no Lightning preimage. Once
+        // `MeltQuoteState::Paid` is confirmed, return an empty `preimage`
+        // string rather than fabricating a fake one or reporting a settled
+        // spend as failed.
+        let mut proof = finalized
+            .payment_proof()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let mut state = finalized.state();
+        if proof.is_none() || state != MeltQuoteState::Paid {
+            let checked = self
+                .wallet
+                .check_melt_quote_status(&quote.id)
+                .await
+                .map_err(|e| melt_error(&e))?;
+            state = checked.state;
+            if proof.is_none() {
+                proof = checked.payment_proof.filter(|s| !s.is_empty());
+            }
+        }
+        if state != MeltQuoteState::Paid {
+            return Err(nip47_err(
+                ErrorCode::PaymentFailed,
+                format!("melt quote is not paid (state: {state:?})"),
+            ));
+        }
+
+        let preimage = proof.unwrap_or_default();
+        let total_fees = finalized
+            .fee_paid()
+            .checked_add(swap_fee)
+            .ok_or_else(|| nip47_err(ErrorCode::Internal, "fee calculation overflow"))?;
+        let fees_paid = amount_to_msat(total_fees, &self.wallet.unit)?;
 
         Ok(PayInvoiceResponse {
             preimage,
@@ -1791,5 +1837,144 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::Other);
         assert!(err.message.contains("required"));
+    }
+    async fn setup_mock_wallet_for_melt(
+        input_fee_ppk: u64,
+        proof_amount: u64,
+        quote_amount: u64,
+    ) -> (
+        Arc<Wallet>,
+        Arc<MockMintConnector>,
+        cdk_common::MeltQuoteBolt11Response<String>,
+    ) {
+        let db = crate::wallet::test_utils::create_test_db().await;
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.enable_mint_signing();
+        let mut keyset = mock_client.keysets.lock().unwrap()[0].clone();
+        keyset.input_fee_ppk = input_fee_ppk;
+        let keyset_id = keyset.id;
+        mock_client.set_active_keyset(keyset);
+
+        db.update_proofs(
+            vec![crate::wallet::test_utils::test_proof_info(
+                keyset_id,
+                proof_amount,
+                crate::wallet::test_utils::test_mint_url(),
+            )],
+            vec![],
+        )
+        .await
+        .expect("seed proofs");
+
+        let quote_id = "melt-quote-test".to_string();
+        let quote_resp = cdk_common::MeltQuoteBolt11Response {
+            quote: quote_id.clone(),
+            amount: Amount::from(quote_amount),
+            fee_reserve: Amount::ZERO,
+            state: MeltQuoteState::Unpaid,
+            expiry: 9_999_999_999,
+            payment_preimage: None,
+            change: None,
+            request: Some(TEST_BOLT11.to_string()),
+            unit: Some(CurrencyUnit::Sat),
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+        };
+        mock_client.push_post_melt_quote_response(Ok(cdk_common::MeltQuoteCreateResponse::Bolt11(
+            quote_resp.clone(),
+        )));
+
+        let wallet = Arc::new(
+            crate::wallet::test_utils::create_test_wallet_with_mock(db, mock_client.clone()).await,
+        );
+        (wallet, mock_client, quote_resp)
+    }
+
+    #[tokio::test]
+    async fn pay_invoice_fees_paid_includes_pre_melt_swap_input_fee() {
+        // One 64-sat proof on a mint with input_fee_ppk=100 (like Mutinynet):
+        // paying a 10-sat invoice requires a pre-melt swap (1 sat fee) plus
+        // melting the swapped proofs (1 sat fee), dropping wallet balance by
+        // 12 sat (10 + 2 fee). `fees_paid` must report all 2000 msat.
+        let (wallet, mock_client, mut quote_resp) = setup_mock_wallet_for_melt(100, 64, 10).await;
+        quote_resp.state = MeltQuoteState::Paid;
+        quote_resp.payment_preimage = Some("ab".repeat(32));
+        mock_client.set_post_melt_response(Ok(cdk_common::MeltQuoteResponse::Bolt11(quote_resp)));
+
+        let balance_before = wallet.total_balance().await.expect("balance before");
+        let handler = WalletNwcHandler::new(wallet.clone(), None);
+        let resp = cdk_nostr::nwc::NwcRequestHandler::pay_invoice(
+            &handler,
+            PayInvoiceRequest::new(TEST_BOLT11),
+        )
+        .await
+        .expect("pay_invoice succeeds");
+        let balance_after = wallet.total_balance().await.expect("balance after");
+
+        let spent_msat = u64::from(balance_before - balance_after) * 1000;
+        assert_eq!(resp.fees_paid, Some(spent_msat - 10_000));
+    }
+
+    #[tokio::test]
+    async fn pay_invoice_recovers_preimage_via_melt_quote_status_when_missing() {
+        let (wallet, mock_client, mut post_resp) = setup_mock_wallet_for_melt(0, 16, 10).await;
+        post_resp.state = MeltQuoteState::Paid;
+        post_resp.payment_preimage = None;
+        mock_client
+            .set_post_melt_response(Ok(cdk_common::MeltQuoteResponse::Bolt11(post_resp.clone())));
+
+        let mut status_resp = post_resp;
+        status_resp.payment_preimage = Some("cd".repeat(32));
+        mock_client.push_melt_quote_status_response(Ok(status_resp));
+
+        let handler = WalletNwcHandler::new(wallet, None);
+        let resp = cdk_nostr::nwc::NwcRequestHandler::pay_invoice(
+            &handler,
+            PayInvoiceRequest::new(TEST_BOLT11),
+        )
+        .await
+        .expect("pay_invoice recovers preimage from quote status");
+        assert_eq!(resp.preimage, "cd".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn pay_invoice_rejects_non_paid_melt_when_preimage_missing() {
+        let (wallet, mock_client, mut post_resp) = setup_mock_wallet_for_melt(0, 16, 10).await;
+        post_resp.state = MeltQuoteState::Paid;
+        post_resp.payment_preimage = None;
+        mock_client
+            .set_post_melt_response(Ok(cdk_common::MeltQuoteResponse::Bolt11(post_resp.clone())));
+
+        let mut status_resp = post_resp;
+        status_resp.state = MeltQuoteState::Unpaid;
+        mock_client.push_melt_quote_status_response(Ok(status_resp));
+
+        let handler = WalletNwcHandler::new(wallet, None);
+        let err = cdk_nostr::nwc::NwcRequestHandler::pay_invoice(
+            &handler,
+            PayInvoiceRequest::new(TEST_BOLT11),
+        )
+        .await
+        .expect_err("must not report success when melt quote is not Paid and no preimage");
+        assert_eq!(err.code, ErrorCode::PaymentFailed);
+    }
+
+    #[tokio::test]
+    async fn pay_invoice_allows_empty_preimage_when_melt_quote_verified_paid() {
+        // Internal same-mint melts on Nutshell 0.21.0 settle as Paid with no preimage.
+        let (wallet, mock_client, mut post_resp) = setup_mock_wallet_for_melt(0, 16, 10).await;
+        post_resp.state = MeltQuoteState::Paid;
+        post_resp.payment_preimage = None;
+        mock_client
+            .set_post_melt_response(Ok(cdk_common::MeltQuoteResponse::Bolt11(post_resp.clone())));
+        mock_client.push_melt_quote_status_response(Ok(post_resp));
+
+        let handler = WalletNwcHandler::new(wallet, None);
+        let resp = cdk_nostr::nwc::NwcRequestHandler::pay_invoice(
+            &handler,
+            PayInvoiceRequest::new(TEST_BOLT11),
+        )
+        .await
+        .expect("verified Paid internal melt succeeds");
+        assert_eq!(resp.preimage, "");
     }
 }

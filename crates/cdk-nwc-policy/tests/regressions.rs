@@ -49,7 +49,13 @@ fn in_flight_payment_across_rollover_is_charged() {
 
     // Period 1: reserve 8_000 for a payment that is still in flight.
     let in_flight = store
-        .authorize("client-pubkey", "pay_invoice", "event-1", 8_000, 1_001)
+        .authorize(
+            "client-pubkey",
+            "pay_invoice",
+            "event-1",
+            8_000,
+            1_000 + 86_400 - 10,
+        )
         .expect("reserve in period 1");
 
     // Period 2 begins (any request triggers the rollover).
@@ -97,7 +103,13 @@ fn in_flight_reservation_counts_in_new_period_until_released() {
     store.add_connection(policy()).expect("add connection");
 
     let in_flight = store
-        .authorize("client-pubkey", "pay_invoice", "event-1", 8_000, 1_001)
+        .authorize(
+            "client-pubkey",
+            "pay_invoice",
+            "event-1",
+            8_000,
+            1_000 + 86_400 - 10,
+        )
         .expect("reserve in period 1");
 
     let err = store
@@ -133,7 +145,13 @@ fn carried_reservation_refunds_unused_fee_reserve() {
     store.add_connection(policy()).expect("add connection");
 
     let in_flight = store
-        .authorize("client-pubkey", "pay_invoice", "event-1", 8_000, 1_001)
+        .authorize(
+            "client-pubkey",
+            "pay_invoice",
+            "event-1",
+            8_000,
+            1_000 + 86_400 - 10,
+        )
         .expect("reserve");
     store
         .authorize("client-pubkey", "get_balance", "event-2", 0, DAY + 1_002)
@@ -206,6 +224,7 @@ async fn insufficient_balance_releases_reservation() {
         let ctx = RequestContext {
             event_id: format!("event-{i}"),
             client_pubkey: "client-pubkey".to_owned(),
+            created_at: 1_001,
             received_at: 1_001,
         };
         let error = handler
@@ -219,4 +238,185 @@ async fn insufficient_balance_releases_reservation() {
         );
     }
     assert_eq!(handler.used_msat("app-1"), Some(0));
+}
+
+#[test]
+fn concurrent_create_connection_preserves_other_process_records() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mgr_path = dir.path().join("manager.json");
+    let pol_path = dir.path().join("policy.json");
+
+    let mut mgr_a = cdk_nwc_policy::manager::ConnectionManager::new(
+        &mgr_path,
+        &pol_path,
+        Arc::new(BrokeWallet),
+    )
+    .expect("mgr_a");
+    let mut mgr_b = cdk_nwc_policy::manager::ConnectionManager::new(
+        &mgr_path,
+        &pol_path,
+        Arc::new(BrokeWallet),
+    )
+    .expect("mgr_b");
+
+    mgr_a
+        .create_connection(
+            "app-a".to_owned(),
+            vec!["wss://relay.example".to_owned()],
+            policy(),
+        )
+        .expect("create a");
+    mgr_b
+        .create_connection(
+            "app-b".to_owned(),
+            vec!["wss://relay.example".to_owned()],
+            policy(),
+        )
+        .expect("create b");
+
+    let on_disk =
+        cdk_nwc_policy::manager::ConnectionManager::<BrokeWallet>::list_records(&mgr_path)
+            .expect("list");
+    assert_eq!(
+        on_disk.len(),
+        2,
+        "second manager must not overwrite first connection"
+    );
+}
+
+/// Simulate a crash between `authorize` and `commit`/`release`: a reservation
+/// older than the reservation TTL expires (settled fail-closed in its own
+/// period) and must not stay in the ledger forever or brick future periods.
+#[test]
+fn stale_reservation_expires_and_does_not_brick_future_periods() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("policy.json");
+    let mut store = PolicyStore::new(&path).expect("store");
+    store.add_connection(policy()).expect("add connection");
+
+    // Process reserves 8_000 at t=1_001 and crashes before commit/release.
+    let crashed = store
+        .authorize("client-pubkey", "pay_invoice", "event-crash", 8_000, 1_001)
+        .expect("reserve before crash");
+    drop(store);
+
+    // Next day (well past reservation TTL and daily rollover), process restarts.
+    let mut reopened = PolicyStore::new(&path).expect("reopen");
+    // Period 2 must not carry the crashed reservation from yesterday.
+    reopened
+        .authorize(
+            "client-pubkey",
+            "pay_invoice",
+            "event-next-day",
+            9_000,
+            DAY + 1_002,
+        )
+        .expect("expired reservation must not brick next period's budget");
+
+    // Late commit for the already-expired reservation must not subtract from period 2.
+    let _ = reopened.commit(&crashed.id, 0);
+    assert_eq!(reopened.used_msat("app-1").expect("used"), Some(9_000));
+}
+
+/// Replay ledger stays bounded by pruning event IDs past the acceptance window,
+/// while replaying an old event whose ID was pruned is still rejected by age.
+#[test]
+fn replay_ledger_prunes_expired_events_and_rejects_stale_replay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("policy.json");
+    let mut store = PolicyStore::new(&path)
+        .expect("store")
+        .with_replay_window(60);
+    store.add_connection(policy()).expect("add connection");
+
+    // Record 50 events at t=1_000..1_050.
+    for i in 0..50u64 {
+        store
+            .authorize_event(
+                "client-pubkey",
+                "get_balance",
+                &format!("evt-{i}"),
+                0,
+                1_000 + i,
+                1_000 + i,
+            )
+            .expect("authorize");
+    }
+    assert_eq!(store.seen_event_count().expect("count"), 50);
+
+    // Advance past the 60s window for all 50 events; authorizing one new event
+    // must prune every expired ID from the ledger.
+    store
+        .authorize_event("client-pubkey", "get_balance", "evt-fresh", 0, 1_200, 1_200)
+        .expect("fresh event");
+    assert_eq!(store.seen_event_count().expect("pruned count"), 1);
+
+    // Replaying `evt-0` (now pruned from `seen_events`) with its original
+    // `created_at` must STILL be rejected because it is outside the window.
+    let err = store
+        .authorize_event("client-pubkey", "get_balance", "evt-0", 0, 1_000, 1_201)
+        .expect_err("pruned event must be rejected as stale");
+    assert!(matches!(err, cdk_nwc_policy::PolicyError::StaleRequest));
+
+    // Events created too far in the future are also rejected so an attacker
+    // cannot pin entries in the replay ledger indefinitely.
+    let err = store
+        .authorize_event(
+            "client-pubkey",
+            "get_balance",
+            "evt-future",
+            0,
+            5_000,
+            1_201,
+        )
+        .expect_err("far-future event must be rejected");
+    assert!(matches!(err, cdk_nwc_policy::PolicyError::StaleRequest));
+}
+
+/// Legacy policy files with an `"events": [...]` array must load cleanly,
+/// still block immediate replays, and migrate/prune over time.
+#[test]
+fn legacy_events_array_migrates_and_prunes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("policy.json");
+    let mut pol = policy();
+    pol.period_start_secs = 1_000;
+    let legacy = serde_json::json!({
+        "connections": [pol],
+        "events": ["legacy-evt-1"],
+        "reservations": []
+    });
+    std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+    let mut store = PolicyStore::new(&path)
+        .expect("load legacy")
+        .with_replay_window(60);
+    let err = store
+        .authorize_event(
+            "client-pubkey",
+            "get_balance",
+            "legacy-evt-1",
+            0,
+            1_010,
+            1_010,
+        )
+        .expect_err("legacy event must still be rejected as replayed");
+    assert!(matches!(err, cdk_nwc_policy::PolicyError::Replayed));
+
+    // First write migrates legacy entries with one full retention window from `now`.
+    store
+        .authorize_event(
+            "client-pubkey",
+            "get_balance",
+            "migrated-at-1010",
+            0,
+            1_010,
+            1_010,
+        )
+        .expect("migrates legacy");
+    // Past that retention window, the migrated legacy entries are pruned.
+    store
+        .authorize_event("client-pubkey", "get_balance", "new-evt", 0, 1_200, 1_200)
+        .expect("fresh");
+    assert_eq!(store.seen_event_count().expect("pruned"), 1);
 }

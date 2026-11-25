@@ -51,9 +51,17 @@ pub const SUPPORTED_METHODS: [&str; 6] = [
 
 const SUPPORTED_ENCRYPTION_SCHEMES: &str = "nip44_v2 nip04";
 
-/// Maximum number of recently-seen request event ids kept for replay
-/// protection. Bounded to keep memory usage flat on long-running services.
+/// Maximum number of recently-seen request event ids kept in memory for
+/// fast relay-level deduplication.
 const DEDUP_CAPACITY: usize = 10_000;
+
+/// Maximum age (in seconds) of a request's `created_at` relative to service
+/// receive time. Requests older than this are dropped so persistent replay
+/// ledgers can safely prune entries past the window without admitting replays.
+pub const MAX_REQUEST_AGE_SECS: u64 = 3_600;
+
+/// Maximum clock skew (in seconds) allowed ahead of the service clock.
+pub const MAX_FUTURE_SKEW_SECS: u64 = 300;
 
 /// Encryption scheme negotiated for a single request/response exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +95,7 @@ pub struct NwcService {
     client_pubkey: PublicKey,
     relays: Vec<RelayUrl>,
     lud16: Option<String>,
+    allowed_methods: Option<Vec<String>>,
 }
 
 impl NwcService {
@@ -108,7 +117,30 @@ impl NwcService {
             client_pubkey,
             relays: config.relays,
             lud16: config.lud16,
+            allowed_methods: None,
         })
+    }
+
+    /// Restrict the methods advertised in the kind `13194` info event for
+    /// this connection. Unrecognized method names are ignored; canonical
+    /// advertisement order is preserved.
+    #[must_use]
+    pub fn with_allowed_methods(mut self, methods: Vec<String>) -> Self {
+        self.allowed_methods = Some(methods);
+        self
+    }
+
+    /// Space-separated method list advertised in the kind `13194` info event.
+    pub fn info_event_content(&self) -> String {
+        match &self.allowed_methods {
+            Some(allowed) => SUPPORTED_METHODS
+                .iter()
+                .copied()
+                .filter(|method| allowed.iter().any(|candidate| candidate == method))
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => SUPPORTED_METHODS.join(" "),
+        }
     }
 
     /// Public key of the wallet service (advertised in the connection URI).
@@ -216,8 +248,16 @@ impl NwcService {
                 continue;
             }
 
-            if event.is_expired() || is_before_start(&event, started_at) {
-                tracing::debug!("Dropping stale NWC request {}", event.id);
+            if event.is_expired()
+                || is_before_start(&event, started_at)
+                || is_outside_acceptance_window(
+                    &event,
+                    Timestamp::now(),
+                    MAX_REQUEST_AGE_SECS,
+                    MAX_FUTURE_SKEW_SECS,
+                )
+            {
+                tracing::debug!("Dropping stale or out-of-window NWC request {}", event.id);
                 continue;
             }
 
@@ -243,7 +283,7 @@ impl NwcService {
     /// Publish the kind `13194` info event advertising supported commands and
     /// encryption schemes.
     async fn publish_info_event(&self, client: &NostrClient) -> Result<()> {
-        let content = SUPPORTED_METHODS.join(" ");
+        let content = self.info_event_content();
 
         let event = EventBuilder::new(Kind::WalletConnectInfo, content)
             .tags([info_event_encryption_tag()])
@@ -268,11 +308,26 @@ fn is_before_start(event: &Event, started_at: Timestamp) -> bool {
     event.created_at < started_at
 }
 
+/// Return true when a request's `created_at` falls outside the bounded
+/// `[now - max_age_secs, now + max_future_skew_secs]` acceptance window.
+fn is_outside_acceptance_window(
+    event: &Event,
+    now: Timestamp,
+    max_age_secs: u64,
+    max_future_skew_secs: u64,
+) -> bool {
+    let created = event.created_at.as_secs();
+    let now_secs = now.as_secs();
+    created < now_secs.saturating_sub(max_age_secs)
+        || created > now_secs.saturating_add(max_future_skew_secs)
+}
+
 /// Build policy context with service-received time, not client-supplied time.
 fn request_context(event: &Event) -> RequestContext {
     RequestContext {
         event_id: event.id.to_hex(),
         client_pubkey: event.pubkey.to_hex(),
+        created_at: event.created_at.as_secs(),
         received_at: Timestamp::now().as_secs(),
     }
 }
@@ -591,6 +646,7 @@ mod tests {
         let ctx = crate::nwc::handler::RequestContext {
             event_id: "evt-42".to_owned(),
             client_pubkey: "client".to_owned(),
+            created_at: 123,
             received_at: 123,
         };
 
@@ -676,6 +732,7 @@ mod tests {
         let context = crate::nwc::handler::RequestContext {
             event_id: "event-1".to_owned(),
             client_pubkey: "client".to_owned(),
+            created_at: 1,
             received_at: 1,
         };
         let response = dispatch(&MockHandler, Request::get_balance(), &context).await;
@@ -700,11 +757,62 @@ mod tests {
         let context = crate::nwc::handler::RequestContext {
             event_id: "event-2".to_owned(),
             client_pubkey: "client".to_owned(),
+            created_at: 1,
             received_at: 1,
         };
         let response = dispatch(&MockHandler, request, &context).await;
         let error = response.error.expect("unsupported method should error");
         assert_eq!(error.code, ErrorCode::NotImplemented);
         assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn info_event_advertises_only_allowed_methods_in_canonical_order() {
+        let config = NwcServiceConfig {
+            service_keys: Keys::generate(),
+            client_secret: SecretKey::generate(),
+            relays: vec![RelayUrl::parse("wss://relay.example.com").expect("relay")],
+            lud16: None,
+        };
+        let default_service = NwcService::new(config.clone()).expect("service");
+        assert_eq!(
+            default_service.info_event_content(),
+            SUPPORTED_METHODS.join(" ")
+        );
+
+        let scoped = NwcService::new(config)
+            .expect("service")
+            .with_allowed_methods(vec![
+                "get_info".to_owned(),
+                "bogus_method".to_owned(),
+                "get_balance".to_owned(),
+            ]);
+        assert_eq!(scoped.info_event_content(), "get_balance get_info");
+    }
+
+    #[test]
+    fn acceptance_window_rejects_old_and_far_future_events() {
+        let keys = Keys::generate();
+        let mk = |ts: u64| {
+            EventBuilder::new(Kind::WalletConnectRequest, "x")
+                .custom_created_at(Timestamp::from_secs(ts))
+                .finalize(&keys)
+                .expect("event")
+        };
+        let now = Timestamp::from_secs(10_000);
+        assert!(is_outside_acceptance_window(
+            &mk(10_000 - 3_601),
+            now,
+            3_600,
+            300
+        ));
+        assert!(!is_outside_acceptance_window(
+            &mk(10_000 - 3_600),
+            now,
+            3_600,
+            300
+        ));
+        assert!(!is_outside_acceptance_window(&mk(10_300), now, 3_600, 300));
+        assert!(is_outside_acceptance_window(&mk(10_301), now, 3_600, 300));
     }
 }

@@ -18,7 +18,8 @@ use cdk::nuts::CurrencyUnit;
 use cdk::wallet::{WalletBuilder, WalletNwcHandler};
 use cdk_fake_wallet::create_fake_invoice;
 use cdk_integration_tests::init_pure_tests::{
-    create_and_start_in_memory_test_mint, fund_wallet, setup_tracing, DirectMintConnection,
+    create_and_start_in_memory_test_mint, create_and_start_in_memory_test_mint_with_fee,
+    fund_wallet, setup_tracing, DirectMintConnection,
 };
 use cdk_nostr::nwc::{NwcService, NwcServiceConfig};
 use cdk_nwc_forward::ForwardingNwcHandler;
@@ -561,6 +562,16 @@ async fn manager_e2e_create_start_and_revoke() {
         wait_for_info_event(&relay.url, service_pubkey, Duration::from_secs(15)).await,
         "managed service info event not found"
     );
+    let info_event = relay
+        .events()
+        .await
+        .into_iter()
+        .rfind(|e| e.kind == Kind::WalletConnectInfo && e.pubkey == service_pubkey)
+        .expect("managed info event in relay");
+    assert_eq!(
+        info_event.content, "pay_invoice get_balance get_info",
+        "kind 13194 info event must only advertise connection's allowed methods"
+    );
 
     let parsed_uri: NostrWalletConnectUri = uri.parse().expect("managed nwc uri");
     let client = NostrWalletConnect::builder(parsed_uri)
@@ -706,5 +717,122 @@ async fn forwarding_policy_e2e_uses_upstream_wallet() {
     downstream_cancel.cancel();
     let _ = upstream_task.await;
     let _ = downstream_task.await;
+    let _ = std::fs::remove_file(&ledger_path);
+}
+
+#[tokio::test]
+async fn policy_nwc_e2e_tracks_input_fees_in_budget() {
+    setup_tracing();
+    let relay = TestRelay::start().await;
+
+    // 1000 ppk = 1 sat input fee per proof spent in swap or melt.
+    let mint = create_and_start_in_memory_test_mint_with_fee(1_000)
+        .await
+        .expect("in-memory test mint with fee");
+    let mint_info = mint.mint_info().await.expect("mint info");
+    let mint_url = mint_info
+        .urls
+        .as_ref()
+        .and_then(|urls| urls.first())
+        .expect("mint url")
+        .clone();
+    let connector = DirectMintConnection::new(mint.clone());
+    let localstore: Arc<dyn WalletDatabase<cdk_database::Error> + Send + Sync> = Arc::new(
+        cdk_sqlite::wallet::memory::empty()
+            .await
+            .expect("wallet database"),
+    );
+    let seed = bip39::Mnemonic::generate(12)
+        .expect("mnemonic")
+        .to_seed_normalized("");
+    let wallet = WalletBuilder::new()
+        .mint_url(mint_url.parse().expect("mint url"))
+        .unit(CurrencyUnit::Sat)
+        .localstore(localstore)
+        .seed(seed)
+        .client(connector)
+        .use_http_subscription()
+        .build()
+        .expect("test wallet");
+    // Fund with one 1_000-sat mint quote so a smaller melt requires a pre-melt swap
+    // or multi-proof spend that incurs input fees.
+    fund_wallet(&wallet, 1_000, None)
+        .await
+        .expect("fund wallet");
+    let wallet = Arc::new(wallet);
+    let balance_before_sat: u64 = wallet.total_balance().await.expect("balance before").into();
+
+    let service_secret_key = wallet.derive_nwc_secret_key().expect("nwc key");
+    let service_keys = Keys::parse(&service_secret_key.to_secret_hex()).expect("service keys");
+    let client_secret = SecretKey::generate();
+    let client_pubkey = Keys::new(client_secret.clone()).public_key();
+    let ledger_path =
+        std::env::temp_dir().join(format!("nwc-policy-fee-e2e-{}.json", uuid::Uuid::new_v4()));
+
+    let wallet_handler = Arc::new(WalletNwcHandler::new(wallet.clone(), None));
+    let handler =
+        Arc::new(PolicyNwcHandler::new(&ledger_path, wallet_handler).expect("policy handler"));
+    let mut fee_policy = policy(client_pubkey);
+    fee_policy.id = "e2e-fee-app".to_owned();
+    fee_policy.max_fee_reserve_msat = 50_000;
+    handler.add_connection(fee_policy).expect("policy");
+
+    let service = NwcService::new(NwcServiceConfig {
+        service_keys,
+        client_secret,
+        relays: vec![relay.url.clone()],
+        lud16: None,
+    })
+    .expect("nwc service");
+    let uri = service.connection_uri().to_string();
+    let service_pubkey = service.service_pubkey();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task_handler = handler.clone();
+    let service_task = tokio::spawn(async move {
+        let _ = service.run(task_handler, task_cancel).await;
+    });
+
+    assert!(
+        wait_for_info_event(&relay.url, service_pubkey, Duration::from_secs(15)).await,
+        "service info event not found"
+    );
+
+    let parsed_uri: NostrWalletConnectUri = uri.parse().expect("nwc uri");
+    let nwc_client = NostrWalletConnect::builder(parsed_uri)
+        .timeout(Duration::from_secs(30))
+        .build();
+
+    // Odd amount (123 sats = 123_000 msat) forces proof selection / pre-melt swap with input_fee_ppk=1000.
+    let fake_invoice = create_fake_invoice(123_000, "fee e2e payment".to_owned());
+    let paid = nwc_client
+        .pay_invoice(PayInvoiceRequest {
+            id: None,
+            invoice: fake_invoice.to_string(),
+            amount: None,
+        })
+        .await
+        .expect("pay_invoice with input fees");
+
+    let balance_after_sat: u64 = wallet.total_balance().await.expect("balance after").into();
+    let true_delta_msat = (balance_before_sat - balance_after_sat) * 1_000;
+    let fees_paid_msat = paid.fees_paid.expect("fees_paid reported");
+    assert!(
+        fees_paid_msat > 0,
+        "expected non-zero fee including mint input_fee_ppk"
+    );
+    assert_eq!(
+        123_000 + fees_paid_msat,
+        true_delta_msat,
+        "reported invoice + fees_paid must equal true wallet balance delta"
+    );
+    assert_eq!(
+        handler.used_msat("e2e-fee-app").expect("used budget"),
+        true_delta_msat,
+        "budget used_msat must match true wallet balance delta including input_fee_ppk"
+    );
+
+    cancel.cancel();
+    let _ = service_task.await;
     let _ = std::fs::remove_file(&ledger_path);
 }

@@ -29,6 +29,8 @@ pub struct RequestContext {
     pub event_id: String,
     /// Hex-encoded authorized client public key.
     pub client_pubkey: String,
+    /// Unix timestamp from the Nostr request event's `created_at` field.
+    pub created_at: u64,
     /// Unix timestamp when the wallet service received the request.
     pub received_at: u64,
 }
