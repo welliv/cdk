@@ -4,7 +4,6 @@ Start here depending on what you need:
 
 - [Plain-language walkthrough](EXPLAINER.md) — how this works for real Cashu users.
 - [Demo and reproduction](DEMO.md) — commands and observable behavior.
-- [Live Mutinynet evidence](MUTINYNET_LIVE_EVIDENCE.md) — real CDK deployment, funding and back-and-forth tests.
 - [Test evidence](TEST_EVIDENCE.md) — local and live signet verification.
 - [November delta](NOVEMBER_DELTA.md) — what was built in November versus the baseline.
 - [Manager CLI guide](../../NWC_POLICY_MANAGER_CLI.md) — operator commands.

@@ -1,5 +1,5 @@
 > [!NOTE]
-> **Nut November submission:** this fork adds a per-connection policy layer for CDK's Cashu-backed NWC service: budgets, method allowlists, fee reserves, expiry, revocation and replay protection. Start with [SUBMISSION.md](SUBMISSION.md), the [plain-language walkthrough](docs/nwc-policy/EXPLAINER.md), or the [demo guide](docs/nwc-policy/DEMO.md).
+> **NWC policy layer:** this fork adds per-connection budgets, method allowlists, fee reserves, expiry, revocation and replay protection for CDK's Cashu-backed NWC service. See the [operator CLI guide](NWC_POLICY_MANAGER_CLI.md), the [walkthrough](docs/nwc-policy/EXPLAINER.md), and [test evidence](docs/nwc-policy/TEST_EVIDENCE.md).
 
 > [!Warning]
 > This project is in early development, it does however work with real sats! Always use amounts you don't mind losing.
