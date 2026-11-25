@@ -35,4 +35,4 @@ available as an explicit opt-in.
 
 ## License
 
-MIT, same as the rest of cdk.
+MIT or Apache-2.0, at your option, same as the rest of CDK.

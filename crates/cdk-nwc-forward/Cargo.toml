@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "Forwards CDK NWC requests to an upstream NWC wallet service"
 
 [dependencies]

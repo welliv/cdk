@@ -12,10 +12,11 @@ cargo test \
   -p cdk-nwc-policy \
   -p cdk-nwc-forward \
   -p cdk-nwc-policy-cli \
+  -p cdk-nwc-pocket \
   --no-fail-fast
 ```
 
-Expected: 45 tests pass.
+Expected: all tests pass (73 on 26 Nov). The pocket integration tests are in `NWC.md`.
 
 ## Create a local connection
 

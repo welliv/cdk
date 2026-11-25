@@ -1,5 +1,5 @@
 > [!NOTE]
-> **NWC policy layer:** this fork adds per-connection budgets, method allowlists, fee reserves, expiry, revocation and replay protection for CDK's Cashu-backed NWC service. See the [operator CLI guide](NWC_POLICY_MANAGER_CLI.md), the [walkthrough](docs/nwc-policy/EXPLAINER.md), and [test evidence](docs/nwc-policy/TEST_EVIDENCE.md).
+> **Safe NWC links for Cashu:** this fork gives every Nostr Wallet Connect link its own Cashu pocket, so a leaked link or rogue agent can lose at most that pocket. See [NWC.md](NWC.md) (overview, setup, rogue-agent demo), the [operator CLI guide](NWC_POLICY_MANAGER_CLI.md) and [what was built in November](NOVEMBER.md).
 
 > [!Warning]
 > This project is in early development, it does however work with real sats! Always use amounts you don't mind losing.

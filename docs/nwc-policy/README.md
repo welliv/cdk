@@ -5,7 +5,8 @@ Start here depending on what you need:
 - [Plain-language walkthrough](EXPLAINER.md) — how this works for real Cashu users.
 - [Demo and reproduction](DEMO.md) — commands and observable behavior.
 - [Test evidence](TEST_EVIDENCE.md) — local and live signet verification.
-- [November delta](NOVEMBER_DELTA.md) — what was built in November versus the baseline.
+- [November delta](NOVEMBER_DELTA.md) — first-pass summary; [NOVEMBER.md](../../NOVEMBER.md) has the full commit list.
+- [NWC.md](../../NWC.md) — overview of pockets, setup and the rogue-agent demo.
 - [Manager CLI guide](../../NWC_POLICY_MANAGER_CLI.md) — operator commands.
 - [E2E guide](../../NWC_POLICY_E2E.md) — harness details.
 - [Live test guide](../../NWC_POLICY_MUTINYNET_LIVE.md) — live-test setup.
