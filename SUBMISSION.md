@@ -52,7 +52,7 @@ The November work is the per-connection policy, forwarding and operator tooling 
 
 ## Verification
 
-See [docs/nwc-policy/TEST_EVIDENCE.md](docs/nwc-policy/TEST_EVIDENCE.md).
+Live signet validation completed against two Alby Hub Cashu NWC connections, including a real 1,000 msat payment through our policy layer. See [docs/nwc-policy/TEST_EVIDENCE.md](docs/nwc-policy/TEST_EVIDENCE.md).
 
 ## Limitations
 
