@@ -50,6 +50,18 @@ nwc-policy-cli \
   --fee-reserve-msat 100
 ```
 
+Optional policy flags:
+
+- `--budget-period never|daily|weekly|monthly|yearly` (default `daily`).
+  Monthly is 30 days and yearly 365 days, counted from the first request
+  after the previous period ended.
+- `--expires-at <unix-seconds>` or `--expires-in <duration>` (for example
+  `3600`, `30m`, `12h`, `7d`, `2w`). Without either, the connection never
+  expires.
+
+A payment still in flight when the budget period rolls over is carried into
+the new period and charged there when it settles.
+
 It prints the `connection_id` and the `nostr+walletconnect://` URI. Give the
 URI only to the app. Keep the connection ID for revocation.
 
@@ -78,8 +90,10 @@ nwc-policy-cli --manager nwc-manager.json --policy nwc-policy.json revoke \
   --id <connection-id>
 ```
 
-This works while `serve` is running. It denies all new requests and stops an
-idle service. An in-flight wallet operation cannot be recalled.
+This works while `serve` is running: the next request on that connection is
+answered `UNAUTHORIZED`. The service keeps listening until `serve` restarts,
+when revoked and expired connections are no longer started. An in-flight
+wallet operation cannot be recalled.
 
 ### Serve all active connections
 
@@ -99,6 +113,11 @@ nwc-policy-cli --upstream-nwc-uri-file /path/to/alby-nwc.uri \
 
 `serve` starts one `NwcService` per active connection, reports the number
 actually started, and stops them on Ctrl+C or error.
+
+With a local CDK wallet, `serve` also mints ecash for paid `make_invoice`
+quotes every `--claim-interval-secs` seconds (default 10, `0` disables).
+Without it, incoming payments never reach the balance. `--network signet`
+overrides the network that `get_info` reports.
 
 ## Storage
 

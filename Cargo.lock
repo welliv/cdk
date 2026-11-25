@@ -1561,6 +1561,7 @@ dependencies = [
  "cdk-nostr",
  "cdk-nwc-forward",
  "cdk-nwc-policy",
+ "cdk-nwc-policy-cli",
  "cdk-postgres",
  "cdk-redb",
  "cdk-signatory",

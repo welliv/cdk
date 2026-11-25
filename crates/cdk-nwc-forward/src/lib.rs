@@ -35,9 +35,45 @@ impl ForwardingNwcHandler {
 }
 
 fn map_error(error: NwcError) -> NIP47Error {
-    NIP47Error {
-        code: ErrorCode::Other,
-        message: error.to_string(),
+    upstream_error_from_message(&error.to_string())
+}
+
+/// Recover the upstream NIP-47 error code from a client error message.
+///
+/// The `nwc` client flattens a wallet error response into the string
+/// `"<message> [<ErrorCode:?>]"`. Preserving the code matters for the policy
+/// layer: `INSUFFICIENT_BALANCE` proves nothing was dispatched, whereas every
+/// other failure is treated as possibly spent. Transport failures and
+/// timeouts carry no code and stay `OTHER`.
+pub fn upstream_error_from_message(text: &str) -> NIP47Error {
+    let parsed = text
+        .strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once(" ["))
+        .and_then(|(message, code)| {
+            let code = match code {
+                "RateLimited" => ErrorCode::RateLimited,
+                "NotImplemented" => ErrorCode::NotImplemented,
+                "InsufficientBalance" => ErrorCode::InsufficientBalance,
+                "PaymentFailed" => ErrorCode::PaymentFailed,
+                "NotFound" => ErrorCode::NotFound,
+                "QuotaExceeded" => ErrorCode::QuotaExceeded,
+                "Restricted" => ErrorCode::Restricted,
+                "Unauthorized" => ErrorCode::Unauthorized,
+                "Internal" => ErrorCode::Internal,
+                "Other" => ErrorCode::Other,
+                _ => return None,
+            };
+            Some((code, message))
+        });
+    match parsed {
+        Some((code, message)) => NIP47Error {
+            code,
+            message: message.to_owned(),
+        },
+        None => NIP47Error {
+            code: ErrorCode::Other,
+            message: text.to_owned(),
+        },
     }
 }
 
@@ -80,5 +116,38 @@ impl NwcRequestHandler for ForwardingNwcHandler {
             .list_transactions(request)
             .await
             .map_err(map_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_upstream_error_codes() {
+        let error = upstream_error_from_message("not enough funds [InsufficientBalance]");
+        assert_eq!(error.code, ErrorCode::InsufficientBalance);
+        assert_eq!(error.message, "not enough funds");
+
+        // Observed live from an Alby Hub Cashu wallet on signet.
+        let error = upstream_error_from_message("outputs are pending [Internal]");
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.message, "outputs are pending");
+    }
+
+    #[test]
+    fn only_the_trailing_code_counts() {
+        let error = upstream_error_from_message("fake [InsufficientBalance] [PaymentFailed]");
+        assert_eq!(error.code, ErrorCode::PaymentFailed);
+        assert_eq!(error.message, "fake [InsufficientBalance]");
+    }
+
+    #[test]
+    fn transport_errors_stay_other() {
+        for text in ["response not received", "timeout [Bogus]", "", "[Internal]"] {
+            let error = upstream_error_from_message(text);
+            assert_eq!(error.code, ErrorCode::Other, "{text:?}");
+            assert_eq!(error.message, text);
+        }
     }
 }

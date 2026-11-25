@@ -63,6 +63,7 @@ uuid = { workspace = true, features = ["js"] }
 [dev-dependencies]
 cdk-nwc-forward = { path = "../cdk-nwc-forward" }
 cdk-nwc-policy = { path = "../cdk-nwc-policy" }
+cdk-nwc-policy-cli = { path = "../cdk-nwc-policy-cli" }
 bip39 = { workspace = true, features = ["rand"] }
 anyhow.workspace = true
 axum.workspace = true

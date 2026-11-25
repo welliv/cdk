@@ -430,8 +430,23 @@ fn rollover_if_needed(file: &mut PolicyFile, index: usize, now: u64) {
     };
     let start = file.connections[index].period_start_secs;
     if now >= start.saturating_add(period) {
+        // Carry unresolved reservations into the new period. A payment that
+        // was authorized before the boundary but has not settled yet may
+        // still spend funds, so it keeps counting against the budget and its
+        // later commit or release adjusts the new period. Dropping it instead
+        // would let a straddling payment go uncharged.
+        let connection_id = file.connections[index].id.clone();
+        let mut carried: u64 = 0;
+        for reservation in file
+            .reservations
+            .iter_mut()
+            .filter(|reservation| reservation.connection_id == connection_id)
+        {
+            reservation.period_start_secs = now;
+            carried = carried.saturating_add(reservation.amount_msat);
+        }
         file.connections[index].period_start_secs = now;
-        file.connections[index].used_msat = 0;
+        file.connections[index].used_msat = carried;
     }
 }
 
@@ -747,10 +762,18 @@ where
                 self.finish(&auth, actual)?;
                 Ok(response)
             }
+            Err(error) if error.code == ErrorCode::InsufficientBalance => {
+                // Insufficient balance is decided before any payment is
+                // dispatched, so nothing can have been spent. Release the
+                // reservation; charging it would let failed attempts drain
+                // the budget without moving funds.
+                self.cancel(&auth);
+                Err(error)
+            }
             Err(error) => {
-                // A payment error is ambiguous: the wallet may have dispatched
-                // the payment before failing to return a preimage. Charge the
-                // reserved amount instead of releasing the budget.
+                // Any other payment error is ambiguous: the wallet may have
+                // dispatched the payment before failing to return a preimage.
+                // Charge the reserved amount instead of releasing the budget.
                 let reserved = invoice_msat.saturating_add(fee_reserve);
                 let _ = self.finish(&auth, reserved);
                 Err(error)

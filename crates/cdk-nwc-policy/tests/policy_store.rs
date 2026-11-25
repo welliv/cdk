@@ -214,7 +214,10 @@ fn two_stores_cannot_double_authorize_the_same_event() {
 }
 
 #[test]
-fn stale_reservation_does_not_refund_new_period() {
+fn stale_reservation_is_carried_and_release_frees_new_period() {
+    // An unresolved reservation from the previous period is carried into the
+    // new one (it may still spend funds), and releasing it frees exactly its
+    // amount in the new period.
     let dir = tempfile::tempdir().expect("temp dir");
     let mut store = PolicyStore::new(dir.path().join("policy.json")).expect("store");
     let mut policy = test_policy();
@@ -224,7 +227,7 @@ fn stale_reservation_does_not_refund_new_period() {
     let first = store
         .authorize("client-pubkey", "pay_invoice", "event-1", 8_000, 1_001)
         .expect("first period payment");
-    let second = store
+    let blocked = store
         .authorize(
             "client-pubkey",
             "pay_invoice",
@@ -232,13 +235,9 @@ fn stale_reservation_does_not_refund_new_period() {
             8_000,
             86_400 + 1_002,
         )
-        .expect("second period payment");
-    assert_eq!(second.amount_msat, 8_000);
-
-    store.release(&first.id).expect("settle stale reservation");
-
-    assert_eq!(store.used_msat("app-1").expect("used"), Some(8_000));
-    let third = store
+        .expect_err("carried reservation still counts in the new period");
+    assert!(matches!(blocked, PolicyError::QuotaExceeded));
+    let second = store
         .authorize(
             "client-pubkey",
             "pay_invoice",
@@ -246,8 +245,22 @@ fn stale_reservation_does_not_refund_new_period() {
             2_000,
             86_400 + 1_003,
         )
-        .expect("budget still available in new period");
-    assert_eq!(third.amount_msat, 2_000);
+        .expect("remaining budget usable");
+    assert_eq!(second.amount_msat, 2_000);
+
+    store.release(&first.id).expect("settle stale reservation");
+
+    assert_eq!(store.used_msat("app-1").expect("used"), Some(2_000));
+    let third = store
+        .authorize(
+            "client-pubkey",
+            "pay_invoice",
+            "event-4",
+            8_000,
+            86_400 + 1_004,
+        )
+        .expect("released budget available in new period");
+    assert_eq!(third.amount_msat, 8_000);
 }
 
 #[test]
