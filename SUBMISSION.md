@@ -4,10 +4,9 @@
 
 A policy layer that turns any CDK Cashu wallet into a safe NWC wallet service for real apps.
 
-## Track
+## Categories
 
-Primary: **Golden Nut / Overall**.  
-Secondary: **Hardest Nut to Crack**.
+Every project is considered for every category. We are not directing judges toward a category; the choice is theirs.
 
 ## Why it matters
 
