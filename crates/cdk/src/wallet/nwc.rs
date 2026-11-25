@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
@@ -40,6 +41,7 @@ use cdk_nostr::nwc::nip47::{
 use cdk_nostr::nwc::service::SUPPORTED_METHODS;
 use lightning_invoice::Bolt11Invoice;
 use nostr::prelude::Timestamp;
+use tokio::time::timeout;
 use tracing::instrument;
 
 use crate::error::Error;
@@ -95,11 +97,15 @@ impl Wallet {
     }
 }
 
+/// Default bound on mint HTTP performed by `make_invoice`.
+pub const DEFAULT_MINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A [`cdk_nostr::nwc::NwcRequestHandler`] backed by a Cashu [`Wallet`].
 #[derive(Debug, Clone)]
 pub struct WalletNwcHandler {
     wallet: Arc<Wallet>,
     max_payment_msat: Option<u64>,
+    mint_request_timeout: Duration,
 }
 
 impl WalletNwcHandler {
@@ -111,7 +117,15 @@ impl WalletNwcHandler {
         Self {
             wallet,
             max_payment_msat,
+            mint_request_timeout: DEFAULT_MINT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the timeout applied to `make_invoice`'s mint-quote request.
+    #[must_use]
+    pub fn with_mint_request_timeout(mut self, mint_request_timeout: Duration) -> Self {
+        self.mint_request_timeout = mint_request_timeout;
+        self
     }
 }
 
@@ -203,6 +217,7 @@ fn mint_quote_error(err: &Error) -> NIP47Error {
             ErrorCode::Other,
             "wallet unit is not supported by this mint for bolt11 mint quotes",
         ),
+        Error::Timeout => nip47_err(ErrorCode::Internal, "mint quote request timed out"),
         other => nip47_err(ErrorCode::Internal, other.to_string()),
     }
 }
@@ -449,16 +464,18 @@ impl cdk_nostr::nwc::NwcRequestHandler for WalletNwcHandler {
 
         let amount = msat_to_amount(request.amount, &self.wallet.unit)?;
 
-        let quote = self
-            .wallet
-            .mint_quote(
+        let quote = timeout(
+            self.mint_request_timeout,
+            self.wallet.mint_quote(
                 PaymentMethod::Known(KnownMethod::Bolt11),
                 Some(amount),
                 request.description.clone(),
                 None,
-            )
-            .await
-            .map_err(|e| mint_quote_error(&e))?;
+            ),
+        )
+        .await
+        .map_err(|_| nip47_err(ErrorCode::Internal, "mint quote request timed out"))?
+        .map_err(|e| mint_quote_error(&e))?;
 
         let payment_hash = payment_hash_of(&quote.request);
 
@@ -1660,6 +1677,49 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::Other);
         assert!(err.message.contains("invoice descriptions"));
+    }
+
+    #[tokio::test]
+    async fn make_invoice_times_out_when_mint_quote_hangs() {
+        let localstore = Arc::new(cdk_sqlite::wallet::memory::empty().await.expect("db"));
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.set_post_mint_quote_delay(Duration::from_secs(30));
+        mock_client.push_post_mint_quote_response(Err(crate::Error::HttpError(
+            None,
+            "hanging mint quote should be interrupted by the handler timeout".to_owned(),
+        )));
+
+        let wallet = crate::wallet::WalletBuilder::new()
+            .mint_url(MintUrl::from_str("https://mint.example.com").expect("mint url"))
+            .unit(CurrencyUnit::Sat)
+            .localstore(localstore)
+            .seed([0x42; 64])
+            .shared_client(mock_client)
+            .build()
+            .expect("wallet");
+
+        let handler = WalletNwcHandler::new(Arc::new(wallet), None)
+            .with_mint_request_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let err = cdk_nostr::nwc::NwcRequestHandler::make_invoice(
+            &handler,
+            MakeInvoiceRequest {
+                amount: 10_000,
+                description: None,
+                description_hash: None,
+                expiry: None,
+            },
+        )
+        .await
+        .expect_err("hanging mint quote must time out");
+
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("timed out"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

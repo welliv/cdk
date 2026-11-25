@@ -527,6 +527,8 @@ pub struct MockMintConnector {
         Mutex<std::collections::VecDeque<Result<MintQuoteResponse<String>, Error>>>,
     /// Captured post_mint_quote requests.
     pub post_mint_quote_requests: Mutex<Vec<MintQuoteRequest>>,
+    /// Optional delay applied before `post_mint_quote` returns, to test timeouts.
+    pub post_mint_quote_delay: Mutex<Option<std::time::Duration>>,
     /// Queue of responses for successive post_mint calls.
     pub post_mint_responses: Mutex<std::collections::VecDeque<Result<MintResponse, Error>>>,
     /// Captured post_mint requests.
@@ -615,6 +617,7 @@ impl MockMintConnector {
             post_mint_response: Mutex::new(None),
             post_mint_quote_responses: Mutex::new(std::collections::VecDeque::new()),
             post_mint_quote_requests: Mutex::new(Vec::new()),
+            post_mint_quote_delay: Mutex::new(None),
             post_mint_responses: Mutex::new(std::collections::VecDeque::new()),
             post_mint_requests: Mutex::new(Vec::new()),
             post_batch_mint_responses: Mutex::new(std::collections::VecDeque::new()),
@@ -638,6 +641,11 @@ impl MockMintConnector {
             payment_request_deliverability: Mutex::new(PaymentRequestDeliverability::Unsupported),
             keysets_unavailable: Mutex::new(false),
         }
+    }
+
+    /// Stall `post_mint_quote` for `delay` so callers can assert they time out.
+    pub fn set_post_mint_quote_delay(&self, delay: std::time::Duration) {
+        *self.post_mint_quote_delay.lock().unwrap() = Some(delay);
     }
 
     pub fn set_check_state_response(&self, response: Result<CheckStateResponse, Error>) {
@@ -1009,6 +1017,10 @@ impl MintConnector for MockMintConnector {
         &self,
         request: MintQuoteRequest,
     ) -> Result<MintQuoteResponse<String>, Error> {
+        let delay = *self.post_mint_quote_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.post_mint_quote_requests.lock().unwrap().push(request);
         self.post_mint_quote_responses
             .lock()

@@ -141,6 +141,10 @@ pub fn restrict_sqlite_sidecars(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bound a single claim pass so a stalled mint HTTP request cannot wedge the
+/// claimer (and, with a shared per-host HTTP connection, every other mint call).
+pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Spawn a background task that claims paid mint quotes every `interval`.
 pub fn spawn_quote_claimer(wallet: Arc<Wallet>, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -148,10 +152,14 @@ pub fn spawn_quote_claimer(wallet: Arc<Wallet>, interval: Duration) -> JoinHandl
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            match claim_paid_quotes(&wallet).await {
-                Ok(0) => {}
-                Ok(amount) => println!("claimed {amount} sat from paid invoices"),
-                Err(error) => eprintln!("claiming paid invoices failed: {error:#}"),
+            match tokio::time::timeout(CLAIM_TIMEOUT, claim_paid_quotes(&wallet)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(amount)) => println!("claimed {amount} sat from paid invoices"),
+                Ok(Err(error)) => eprintln!("claiming paid invoices failed: {error:#}"),
+                Err(_) => eprintln!(
+                    "claiming paid invoices timed out after {}s",
+                    CLAIM_TIMEOUT.as_secs()
+                ),
             }
         }
     })

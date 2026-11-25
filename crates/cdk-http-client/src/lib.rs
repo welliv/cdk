@@ -61,6 +61,16 @@
 /// browser fetch buffering, custom transports or the separate Tor transport.
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Default limit for a single HTTP request (connect, write, and body read).
+///
+/// Backends have no timeout unless one is set. Without this, a stalled TCP
+/// write to a shared pooled connection can block every later request to that
+/// host indefinitely.
+pub const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default TCP/TLS connect timeout, used by backends that expose one separately.
+pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 mod backends;
 mod client;
 #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]

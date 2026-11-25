@@ -1,6 +1,7 @@
 //! bitreq-based backend implementation
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bitreq::RequestExt;
 use serde::de::DeserializeOwned;
@@ -65,6 +66,7 @@ pub struct HttpClient {
     inner: Arc<bitreq::Client>,
     proxy_config: Option<ProxyConfig>,
     no_redirects: bool,
+    request_timeout: Duration,
 }
 
 impl std::fmt::Debug for HttpClient {
@@ -81,6 +83,7 @@ impl HttpClient {
             inner: Arc::new(bitreq::Client::new(10)),
             proxy_config: None,
             no_redirects: false,
+            request_timeout: crate::DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -89,12 +92,14 @@ impl HttpClient {
         client: Arc<bitreq::Client>,
         proxy_config: Option<ProxyConfig>,
         no_redirects: bool,
+        request_timeout: Duration,
     ) -> Self {
         super::install_rustls_crypto_provider();
         Self {
             inner: client,
             proxy_config,
             no_redirects,
+            request_timeout,
         }
     }
 
@@ -151,6 +156,7 @@ impl HttpClient {
             self.inner.clone(),
             self.proxy_config.clone(),
             self.no_redirects,
+            self.request_timeout,
         )
     }
 
@@ -162,6 +168,7 @@ impl HttpClient {
             self.inner.clone(),
             self.proxy_config.clone(),
             self.no_redirects,
+            self.request_timeout,
         )
     }
 
@@ -173,6 +180,7 @@ impl HttpClient {
             self.inner.clone(),
             self.proxy_config.clone(),
             self.no_redirects,
+            self.request_timeout,
         )
     }
 
@@ -184,6 +192,7 @@ impl HttpClient {
             self.inner.clone(),
             self.proxy_config.clone(),
             self.no_redirects,
+            self.request_timeout,
         )
     }
 }
@@ -196,6 +205,7 @@ pub struct BitreqRequestBuilder {
     client: Arc<bitreq::Client>,
     proxy_config: Option<ProxyConfig>,
     no_redirects: bool,
+    request_timeout: Duration,
 }
 
 impl std::fmt::Debug for BitreqRequestBuilder {
@@ -215,6 +225,7 @@ impl BitreqRequestBuilder {
         client: Arc<bitreq::Client>,
         proxy_config: Option<ProxyConfig>,
         no_redirects: bool,
+        request_timeout: Duration,
     ) -> Self {
         Self {
             inner,
@@ -223,6 +234,7 @@ impl BitreqRequestBuilder {
             client,
             proxy_config,
             no_redirects,
+            request_timeout,
         }
     }
     /// Add a header to the request.
@@ -234,6 +246,7 @@ impl BitreqRequestBuilder {
             client: self.client,
             proxy_config: self.proxy_config,
             no_redirects: self.no_redirects,
+            request_timeout: self.request_timeout,
         }
     }
 
@@ -282,8 +295,13 @@ impl BitreqRequestBuilder {
         } else {
             request
         };
+        // bitreq's timeout is in whole seconds and also bounds lock waits on the
+        // shared per-host connection. Without it, a stalled write holds the
+        // connection mutex and every later request to that host hangs forever.
+        let timeout_secs = self.request_timeout.as_secs().max(1);
         let response = request
             .with_max_body_size(crate::MAX_RESPONSE_BYTES)
+            .with_timeout(timeout_secs)
             .send_async_with_client(&self.client)
             .await
             .map_err(HttpError::from)?;
@@ -303,11 +321,23 @@ impl BitreqRequestBuilder {
 }
 
 /// HTTP client builder for configuring proxy and TLS settings
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HttpClientBuilder {
     proxy: Option<ProxyConfig>,
     accept_invalid_certs: bool,
     no_redirects: bool,
+    request_timeout: Duration,
+}
+
+impl Default for HttpClientBuilder {
+    fn default() -> Self {
+        Self {
+            proxy: None,
+            accept_invalid_certs: false,
+            no_redirects: false,
+            request_timeout: crate::DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
 }
 
 impl HttpClientBuilder {
@@ -320,6 +350,12 @@ impl HttpClientBuilder {
     /// Disable automatic HTTP redirect following
     pub fn no_redirects(mut self) -> Self {
         self.no_redirects = true;
+        self
+    }
+
+    /// Set the request timeout (connect, write, and body read).
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -362,6 +398,7 @@ impl HttpClientBuilder {
             Arc::new(bitreq::Client::new(10)),
             self.proxy,
             self.no_redirects,
+            self.request_timeout,
         ))
     }
 }

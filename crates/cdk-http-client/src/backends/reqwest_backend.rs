@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
+use std::time::Duration;
+
 use serde::Serialize;
 
 use super::url_for_debug;
@@ -254,12 +256,26 @@ impl ReqwestRequestBuilder {
     }
 }
 
-#[derive(Debug, Default)]
 /// HTTP client builder for configuring proxy and TLS settings.
+#[derive(Debug)]
 pub struct HttpClientBuilder {
     proxy: Option<ProxyConfig>,
     accept_invalid_certs: bool,
     no_redirects: bool,
+    request_timeout: Duration,
+    connect_timeout: Duration,
+}
+
+impl Default for HttpClientBuilder {
+    fn default() -> Self {
+        Self {
+            proxy: None,
+            accept_invalid_certs: false,
+            no_redirects: false,
+            request_timeout: crate::DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: crate::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
 }
 
 impl HttpClientBuilder {
@@ -272,6 +288,18 @@ impl HttpClientBuilder {
     /// Disable automatic HTTP redirect following.
     pub fn no_redirects(mut self) -> Self {
         self.no_redirects = true;
+        self
+    }
+
+    /// Set the request timeout (connect, write, and body read).
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Set the TCP/TLS connect timeout.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -301,8 +329,11 @@ impl HttpClientBuilder {
     /// Build the HTTP client.
     pub fn build(self) -> Response<HttpClient> {
         super::install_rustls_crypto_provider();
-        let mut builder =
-            reqwest::Client::builder().danger_accept_invalid_certs(self.accept_invalid_certs);
+        let mut builder = reqwest::Client::builder()
+            .danger_accept_invalid_certs(self.accept_invalid_certs)
+            .timeout(self.request_timeout)
+            .connect_timeout(self.connect_timeout)
+            .tcp_nodelay(true);
         if self.no_redirects {
             builder = builder.redirect(reqwest::redirect::Policy::none());
         }

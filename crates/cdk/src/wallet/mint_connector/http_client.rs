@@ -42,6 +42,10 @@ const HTTP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 /// Upper bound for the exponential backoff between replays.
 const HTTP_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
+/// Default bound for mint HTTP requests that are not already covered by a
+/// NUT-19 replay window.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn payment_method_path_segment(method: &PaymentMethod) -> Result<&str, Error> {
     match method {
         PaymentMethod::Known(known) => Ok(known.as_str()),
@@ -97,6 +101,10 @@ where
     /// run over it. A transport handed in pre-configured is asked directly
     /// instead.
     tls_verification_disabled: bool,
+    /// Bound for a single mint HTTP request when the NUT-19 replay window does
+    /// not already impose one. Prevents a stalled transport from hanging
+    /// `make_invoice` / melts forever.
+    request_timeout: Duration,
 }
 
 impl<T> fmt::Debug for HttpClient<T>
@@ -201,15 +209,22 @@ where
         })
     }
 
+    async fn await_http<R>(
+        &self,
+        fut: impl std::future::Future<Output = Result<R, HttpError>>,
+    ) -> Result<R, Error> {
+        match timeout(self.request_timeout, fut).await {
+            Ok(result) => result.map_err(Self::map_http_error),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
+
     async fn transport_http_get<R>(&self, url: Url, auth: Option<AuthToken>) -> Result<R, Error>
     where
         R: DeserializeOwned,
     {
-        self.transport
-            .http_get(url, auth)
-            .await
-            .and_then(RawResponse::json_or_status_error)
-            .map_err(Self::map_http_error)
+        let raw = self.await_http(self.transport.http_get(url, auth)).await?;
+        raw.json_or_status_error().map_err(Self::map_http_error)
     }
 
     async fn transport_http_post<P, R>(
@@ -222,11 +237,10 @@ where
         P: Serialize + Send + Sync,
         R: DeserializeOwned,
     {
-        self.transport
-            .http_post(url, auth, payload)
-            .await
-            .and_then(RawResponse::json_or_status_error)
-            .map_err(Self::map_http_error)
+        let raw = self
+            .await_http(self.transport.http_post(url, auth, payload))
+            .await?;
+        raw.json_or_status_error().map_err(Self::map_http_error)
     }
 
     /// Create new [`HttpClient`] with a provided transport implementation.
@@ -253,7 +267,15 @@ where
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
             cache_support: Default::default(),
             tls_verification_disabled: false,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the per-request HTTP timeout used when no NUT-19 window applies.
+    #[must_use]
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     /// Create new [`HttpClient`]
@@ -267,6 +289,7 @@ where
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
             cache_support: Default::default(),
             tls_verification_disabled: false,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -310,6 +333,7 @@ where
             auth_wallet: Arc::new(RwLock::new(None)),
             cache_support: Default::default(),
             tls_verification_disabled: accept_invalid_certs,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -369,18 +393,18 @@ where
                         .and_then(RawResponse::json_or_status_error),
                 }
             };
-            let result = if retriable_window.is_zero() {
-                request.await
+            let remaining_window = if retriable_window.is_zero() {
+                self.request_timeout
             } else {
-                let remaining = retriable_window.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
-                    return Err(Error::Timeout);
-                }
-
-                match timeout(remaining, request).await {
-                    Ok(result) => result,
-                    Err(_) => return Err(Error::Timeout),
-                }
+                retriable_window.saturating_sub(started.elapsed())
+            };
+            let attempt_timeout = remaining_window.min(self.request_timeout);
+            if attempt_timeout.is_zero() {
+                return Err(Error::Timeout);
+            }
+            let result = match timeout(attempt_timeout, request).await {
+                Ok(result) => result,
+                Err(_) => return Err(Error::Timeout),
             };
 
             match result {
@@ -2043,6 +2067,32 @@ mod tests {
         assert!(matches!(result, Err(Error::Timeout)));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(post_urls.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hanging_post_times_out_without_nut19_window() {
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({ "ok": true }).to_string(),
+            ))),
+            post_delay: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None)
+            .with_request_timeout(Duration::from_millis(200));
+
+        let started = Instant::now();
+        let result: Result<serde_json::Value, Error> = client
+            .transport_http_post(
+                Url::parse("https://mint.example.com/v1/mint/quote/bolt11").expect("url"),
+                None,
+                &serde_json::json!({ "amount": 1, "unit": "sat" }),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout)), "got {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
