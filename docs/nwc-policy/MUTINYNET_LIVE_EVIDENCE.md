@@ -67,6 +67,19 @@ To confirm our own path settles:
 
 So invoice creation, lookup and payment settle correctly inside our CDK/NWC deployment. The pending/failed direction is specific to the Alby Cashu interoperability path tested here.
 
+### Ignored live harness re-run
+
+The ignored test `nwc_policy_mutinynet_live` was re-run four times against the same Alby connection:
+
+```text
+pay_result_ok=false
+pay_error=outputs are pending [Internal] [Other]
+mint_quote_state=unpaid
+test result: FAILED
+```
+
+This confirms the Alby Cashu payment path was not settling in this environment. The test is ignored and is not counted as a passing validation.
+
 ## Policy enforcement
 
 A restricted connection was created with:
@@ -138,4 +151,8 @@ The live run verifies:
 - method allowlists, quota enforcement, reservation cleanup, revocation and expiry;
 - self-payment settlement inside our own stack.
 
-It also uncovered two interoperability failures on the Alby Cashu NWC path: incoming invoices remaining pending after externally observed payment, and outbound payment failing with `no preimage in melt response`. These are recorded honestly and are outside our policy layer.
+It also uncovered inconsistent interoperability failures on the Alby Cashu NWC
+path: incoming invoices remained `pending` after externally observed payment,
+and outbound payment failed with `no preimage in melt response` or
+`outputs are pending [Internal]` with the mint quote staying unpaid. These are
+recorded honestly and are outside our policy layer.

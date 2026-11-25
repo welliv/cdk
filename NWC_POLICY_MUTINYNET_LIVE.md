@@ -24,11 +24,11 @@ What it verifies:
 - the wallet balance decreases;
 - revocation denies a fresh request.
 
-Observed Alby mint-backend behavior: the payment succeeds and the Mutinynet
-mint quote becomes `paid`, but the NWC response has no preimage, so the client
-reports an error. The live test therefore verifies payment by querying the
-mint quote state and checking the wallet balance, not by relying on the
-preimage.
+Observed Alby mint-backend behavior in the latest run: `pay_invoice` fails with
+`outputs are pending [Internal]` and the Mutinynet mint quote remains `unpaid`.
+An earlier run returned no preimage while the quote became paid, so behavior is
+inconsistent across runs. This live test therefore does **not** currently pass
+and is not counted as proof of Alby interoperability.
 
 The policy layer treats payment errors as ambiguous and keeps the reserved
 budget charged instead of releasing it. Failing closed prevents a successful
