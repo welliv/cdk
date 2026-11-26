@@ -92,6 +92,7 @@ fn models_body() -> Value {
     json!({ "object": "list", "data": [
         { "id": "mini", "sats_pricing": { "max_cost": 44.1 } },
         { "id": "big", "sats_pricing": { "max_cost": 735.0 } },
+        { "id": "busy", "sats_pricing": { "max_cost": 44.1 } },
         { "id": "ghost" },
     ]})
 }
@@ -111,12 +112,21 @@ async fn provider_chat(
     let max_cost = match model.as_str() {
         "mini" => 45,
         "big" => 735,
+        "busy" => 45,
         _ => return (StatusCode::NOT_FOUND, "no model").into_response(),
     };
     let Some(token) = headers.get("x-cashu").and_then(|v| v.to_str().ok()) else {
         return (StatusCode::UNAUTHORIZED, "no token").into_response();
     };
     let face = cdk_nwc_policy_cli::ecash::token_value_sat(token).expect("token");
+    if model == "busy" {
+        // routstr-core while its mint rate-limits: 503, our token handed back.
+        let mut response = (StatusCode::SERVICE_UNAVAILABLE, "mint busy").into_response();
+        response
+            .headers_mut()
+            .insert("x-cashu", token.parse().expect("header"));
+        return response;
+    }
     if face < max_cost {
         return (StatusCode::PAYMENT_REQUIRED, "token below max cost").into_response();
     }
@@ -395,7 +405,7 @@ async fn key_proxy_enforces_every_rule_and_books_balance() {
         &[
             Rules {
                 id: "a",
-                models: &["mini", "big", "ghost"],
+                models: &["mini", "big", "ghost", "busy"],
                 cap: Some(60),
                 fund: 100,
                 refill_cap: 60,
@@ -454,6 +464,33 @@ async fn key_proxy_enforces_every_rule_and_books_balance() {
         .expect("json");
     assert_eq!(models["data"].as_array().expect("data").len(), 1);
 
+    // /v1/pocket?model= answers with the price or the key's own refusal,
+    // so routstrd can show it before paying.
+    let info = |key: &'static str, model: &'static str| {
+        let lab = &lab;
+        async move {
+            lab.http
+                .get(format!("{}/v1/pocket?model={model}", lab.url))
+                .bearer_auth(&lab.keys[key].api_key)
+                .send()
+                .await
+                .expect("pocket")
+                .json::<Value>()
+                .await
+                .expect("json")
+        }
+    };
+    let ok = info("b", "mini").await;
+    assert_eq!(ok["price_sat"], 45);
+    assert!(ok.get("refusal").is_none());
+    let refused = info("b", "big").await;
+    assert_eq!(refused["refusal"]["code"], "model_not_allowed");
+    assert_eq!(refused["refusal"]["status"], 403);
+    assert_eq!(
+        info("a", "big").await["refusal"]["code"],
+        "over_request_cap"
+    );
+
     // Pay per request: exact bundle out, change back, provider kept 1.
     let before = sats(lab.pocket("a")).await;
     let reply = lab.chat("a", "mini").await;
@@ -466,6 +503,23 @@ async fn key_proxy_enforces_every_rule_and_books_balance() {
     assert_eq!(lab.provider_paid(), PROVIDER_CHARGE);
     // Isolation: B did not move.
     assert_eq!(sats(lab.pocket("b")).await, b_start);
+
+    // Provider refuses and hands our own token back: the proofs are reused
+    // as they are, no swap, nothing spent, nothing left pending.
+    let before = sats(lab.pocket("a")).await;
+    let reply = lab.chat("a", "busy").await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.header("x-pocket-cost-sat"), 0);
+    assert_eq!(sats(lab.pocket("a")).await, before);
+    assert!(lab
+        .pocket("a")
+        .get_pending_spent_proofs()
+        .await
+        .expect("pending")
+        .is_empty());
+    // ... and the next request sends that same bundle offline.
+    let reply = lab.chat("a", "mini").await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
 
     // The re-bundle cut bundles ahead: the next request sends with no swap,
     // so it costs only the provider's 1 sat + its input fee + the change fee.
@@ -643,8 +697,9 @@ async fn key_proxy_enforces_every_rule_and_books_balance() {
     assert_eq!(sats(lab.pocket("b")).await, b_left);
 
     // Books: everything that left the wallets is the provider's revenue
-    // (1 sat per paid request) plus mint input fees.
-    let paid_requests = 3 + b_paid + a_paid;
+    // (1 sat per paid request) plus mint input fees. Four fixed paid chats:
+    // first, swap-free, streaming, and the one after the handed-back token.
+    let paid_requests = 4 + b_paid + a_paid;
     assert_eq!(lab.provider_paid(), paid_requests * PROVIDER_CHARGE);
     let end_total =
         sats(&lab.main).await + lab.pocket_sats().await + sats(&lab.provider.wallet).await;

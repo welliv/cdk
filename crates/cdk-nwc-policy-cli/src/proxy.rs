@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -46,8 +46,8 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::ecash::{
-    bundle_for, complement_target, forget_sent, loose_amounts, net_receive_sat,
-    reclaim_outstanding, take_exact, take_offline, token_value_sat, Taken,
+    bundle_for, complement_target, forget_sent, is_own_token, loose_amounts, net_receive_sat,
+    reclaim_outstanding, take_exact, take_offline, token_value_sat, unmark_sent, Taken,
 };
 use crate::key::{api_key_digest, load_keys, KeyMeta};
 use crate::pocket::{is_closed, open_pocket};
@@ -367,6 +367,9 @@ enum Landed {
     Parked,
     /// Already spent: nothing to receive.
     Spent,
+    /// The provider handed our own token back unredeemed: its proofs are
+    /// unspent in the pocket again, no swap (sats = face value).
+    Returned(u64),
 }
 
 /// Receive options that shape `token`'s outputs so that, with the loose
@@ -560,7 +563,14 @@ async fn models(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -> Res
     }
 }
 
-async fn pocket_info(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -> Response {
+/// `GET /v1/pocket[?model=…]`: status and balances; with a model, also its
+/// price for this key or the refusal a request to it would get, so a client
+/// (routstrd) can show the key's own reason before trying to pay.
+async fn pocket_info(
+    State(state): State<Arc<ProxyState>>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     let meta = match find_key(&state, &headers) {
         Ok(meta) => meta,
         Err(refusal) => return refusal_response(None, &refusal),
@@ -583,7 +593,7 @@ async fn pocket_info(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -
         } else {
             0
         };
-        Ok(json!({
+        let mut body = json!({
             "key_id": meta.key_id,
             "label": meta.label,
             "status": status,
@@ -595,7 +605,26 @@ async fn pocket_info(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -
             "expires_at": policy.and_then(|p| p.expires_at),
             "mint_url": state.config.mint_url,
             "mint_busy_secs": state.mint_busy(),
-        }))
+        });
+        if let Some(model) = query.get("model") {
+            let checked = match check_key(policy, now) {
+                Err(refusal) => Err(Outcome::Refused(refusal)),
+                Ok(()) if config.swept_at.is_some() => Err(Outcome::Refused(Refusal::Revoked)),
+                Ok(()) => price_for(&state, &meta, model).await,
+            };
+            match checked {
+                Ok(price_sat) => body["price_sat"] = json!(price_sat),
+                Err(Outcome::Refused(refusal)) => {
+                    let (code, name) = refusal.status_and_code();
+                    body["refusal"] = json!({
+                        "status": code.as_u16(), "code": name,
+                        "message": format!("pocket key '{}': {}", meta.label, refusal.message()),
+                    });
+                }
+                Err(Outcome::Busy(_)) | Err(Outcome::Failed(_)) => {}
+            }
+        }
+        Ok(body)
     }
     .await;
     match result {
@@ -852,7 +881,15 @@ async fn pay_and_forward(
 
     // Change back into the same pocket. Routstr sends it in the response
     // header, before the body, so streaming is not delayed.
+    // Refused with our own token handed back (routstr-core does this when
+    // the mint rate-limits it): reuse the proofs, no swap, nothing spent.
+    let own_back = !(200..300).contains(&status)
+        && change
+            .as_deref()
+            .is_some_and(|c| is_own_token(c, &paid.taken.proofs))
+        && unmark_sent(&paid.pocket, &paid.taken.proofs).await.is_ok();
     let (landed, change_face_sat) = match &change {
+        _ if own_back => (Landed::Returned(paid.taken.token_sat), paid.taken.token_sat),
         Some(change) => (
             land(state, &meta.key_id, &paid.pocket, change, Some(price_sat)).await,
             token_value_sat(change).unwrap_or(0),
@@ -866,11 +903,11 @@ async fn pay_and_forward(
     };
     // The sent proofs are settled unless our own token was parked for a
     // retry: forget them so they are not counted as outstanding.
-    if change.is_some() || landed != Landed::Parked {
+    if !own_back && (change.is_some() || landed != Landed::Parked) {
         let _ = forget_sent(&paid.pocket, &paid.taken.proofs).await;
     }
     let change_sat = match landed {
-        Landed::Received(sat) => sat,
+        Landed::Received(sat) | Landed::Returned(sat) => sat,
         _ => 0,
     };
     let provider_kept_sat = paid.taken.token_sat.saturating_sub(change_face_sat);
@@ -909,6 +946,7 @@ async fn pay_and_forward(
             Landed::Received(_) => "received",
             Landed::Parked => "parked",
             Landed::Spent => "none",
+            Landed::Returned(_) => "returned",
         }),
     );
     Ok(response)

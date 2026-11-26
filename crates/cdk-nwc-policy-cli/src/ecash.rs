@@ -332,6 +332,36 @@ pub async fn forget_sent(wallet: &Wallet, proofs: &Proofs) -> Result<(), cdk::Er
     Ok(())
 }
 
+/// Whether `token` holds exactly the proofs we sent (same secrets): the
+/// receiver handed our own token back without redeeming it.
+pub fn is_own_token(token: &str, sent: &Proofs) -> bool {
+    use std::collections::HashSet;
+    use std::str::FromStr;
+    let Ok(parsed) = Token::from_str(token) else {
+        return false;
+    };
+    let back: HashSet<String> = parsed
+        .token_secrets()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let ours: HashSet<String> = sent.iter().map(|p| p.secret.to_string()).collect();
+    !ours.is_empty() && back == ours
+}
+
+/// Put proofs we sent back to `Unspent` without a swap. Only for a token the
+/// provider returned unredeemed: it has seen these secrets already, and the
+/// next request goes to the same provider, so reusing them exposes nothing
+/// new and saves a swap fee and a mint call (which matters while the mint
+/// rate-limits). A sweep swaps them away like any other proof.
+pub async fn unmark_sent(wallet: &Wallet, proofs: &Proofs) -> Result<(), cdk::Error> {
+    wallet
+        .localstore
+        .update_proofs_state(proofs.ys()?, State::Unspent)
+        .await?;
+    Ok(())
+}
+
 /// Swap every sent-but-unredeemed proof of `pocket` into `main`, so a token
 /// handed out earlier (e.g. by `/v1/pocket/send`) is worthless after revoke.
 /// Returns the sats `main` received.
