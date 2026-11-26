@@ -24,6 +24,7 @@ cdk-nwc-pocket = { path = "../cdk-nwc-pocket" }
 cdk-sqlite = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 hex = "0.4"
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 

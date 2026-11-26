@@ -10,6 +10,7 @@ use cdk::wallet::Wallet;
 use cdk_nwc_policy::BudgetPeriod;
 use tokio::task::JoinHandle;
 
+pub mod key;
 pub mod pocket;
 
 /// Parse a `--budget-period` value.

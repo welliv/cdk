@@ -97,11 +97,26 @@ impl Refiller {
         if granted == 0 {
             return Err(Error::RefillCapReached);
         }
-        let max_cost_sat = granted / MSAT_PER_SAT;
+        // Never ask the main wallet for more than it holds: a refill that
+        // fits the grant but not the main balance would otherwise fail
+        // outright and leave the rest of the cap unused. Send what is there.
+        let main_sat = match self.main.total_balance().await {
+            Ok(balance) => u64::from(balance),
+            Err(error) => {
+                self.registry.settle_grant(grant_id, 0)?;
+                return Err(error.into());
+            }
+        };
+        let grant_sat = granted / MSAT_PER_SAT;
+        let max_cost_sat = grant_sat.min(main_sat);
         let amount_sat = want.div_ceil(MSAT_PER_SAT).min(max_cost_sat);
         if amount_sat == 0 {
             self.registry.settle_grant(grant_id, 0)?;
-            return Err(Error::RefillCapReached);
+            return Err(if grant_sat == 0 {
+                Error::RefillCapReached
+            } else {
+                Error::Wallet(cdk::Error::InsufficientFunds)
+            });
         }
         match transfer_to_pocket(
             &self.main,

@@ -135,3 +135,27 @@ cargo test -p cdk-nwc-policy-cli
 ## License
 
 `Apache-2.0 OR MIT`, at your option, matching CDK.
+
+## API keys (`key`)
+
+A key is a pocket link plus its rules, created in one step:
+
+```sh
+nwc-policy-cli key create --mint-url ... --wallet-db ... --relay wss://... \
+  --label app1 --budget 1000 --cap 3000 --window 1d \
+  --max-per-payment 200 --expires 10m --models openai/gpt-4o-mini \
+  --uri-out app1.uri          # JSON on stdout; URI written 0600
+nwc-policy-cli key list  [--mint-url ... --wallet-db ...]   # JSON, with balances
+nwc-policy-cli key revoke --id <key_id> [--mint-url ... --wallet-db ...]
+```
+
+| Rule | Enforced by |
+|---|---|
+| budget (pocket balance) | the mint: the link only holds the pocket's proofs |
+| refill cap per window | the main-wallet refill ledger |
+| max sats per payment | the policy ledger, on `pay_invoice` |
+| expiry | the policy ledger refuses; `serve` sweeps the pocket home |
+| revoke | policy ledger + swap of every pocket proof into main |
+| allowed models | **not** the pocket (a bolt11 has no model); stored and exported by `key list` for the gateway to enforce |
+
+`call --uri-file F info|balance|pay --invoice X` drives a link as a client for testing.

@@ -47,8 +47,9 @@ pub async fn balance_msat(wallet: &Wallet) -> Result<u64, Error> {
 /// The main wallet pays the swap fees, so the pocket receives the amount
 /// sent. Returns `(cost, received)` in sats, where `cost` is what left the
 /// main wallet. If `max_cost` is set, the amount is lowered until the cost
-/// fits; if nothing fits, [`Error::RefillCapReached`] is returned and nothing
-/// is sent.
+/// fits the bound and the main balance; if nothing fits,
+/// [`Error::RefillCapReached`] (or `InsufficientFunds` when main is the
+/// limit) is returned and nothing is sent.
 pub async fn transfer_to_pocket(
     main: &Wallet,
     pocket: &Wallet,
@@ -63,11 +64,24 @@ pub async fn transfer_to_pocket(
     };
     let mut amount = amount;
     let mut prepared = None;
-    for _ in 0..4 {
+    // When main holds about as much as the refill wants, `amount + fee` may
+    // not fit; with a cost bound we step the amount down instead of failing.
+    let mut short_step = Amount::ONE;
+    let mut main_short = false;
+    for _ in 0..8 {
         if amount == Amount::ZERO {
             break;
         }
-        let candidate = main.prepare_send(amount, options.clone()).await?;
+        let candidate = match main.prepare_send(amount, options.clone()).await {
+            Ok(candidate) => candidate,
+            Err(cdk::Error::InsufficientFunds) if max_cost.is_some() => {
+                amount = amount.checked_sub(short_step).unwrap_or(Amount::ZERO);
+                short_step = short_step + short_step;
+                main_short = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let cost = candidate.amount() + candidate.fee();
         match max_cost {
             Some(max_cost) if cost > max_cost => {
@@ -82,6 +96,9 @@ pub async fn transfer_to_pocket(
         }
     }
     let Some((prepared, cost)) = prepared else {
+        if main_short {
+            return Err(Error::Wallet(cdk::Error::InsufficientFunds));
+        }
         return Err(Error::RefillCapReached);
     };
     let token = prepared.confirm(None).await?.to_string();

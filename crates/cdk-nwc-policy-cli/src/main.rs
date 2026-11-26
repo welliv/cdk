@@ -23,6 +23,9 @@ use cdk_nwc_pocket::{
 };
 use cdk_nwc_policy::manager::ConnectionManager;
 use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy, PolicyStore};
+use cdk_nwc_policy_cli::key::{
+    keys_path, load_keys, parse_list, relay_first, save_key, write_private, KeyMeta,
+};
 use cdk_nwc_policy_cli::pocket::{
     maintain_pockets, open_pocket, open_wallet, registry_path, DEFAULT_MAINTENANCE_INTERVAL,
 };
@@ -66,6 +69,95 @@ enum Command {
     Pockets(PocketsArgs),
     /// Print a mint invoice for the main wallet and wait until it is paid.
     Fund(FundArgs),
+    /// API keys: each key is an NWC link with its own pocket, budget,
+    /// per-payment cap, expiry and model list.
+    #[command(subcommand)]
+    Key(KeyCommand),
+    /// Call an NWC link as a client (testing): info, balance or pay.
+    Call(CallArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Create a key: a pocket, its NWC link and its rules. Prints JSON.
+    Create(Box<KeyCreateArgs>),
+    /// List keys with status, balances and rules as JSON.
+    List(PocketsArgs),
+    /// Revoke a key and sweep its pocket home.
+    Revoke(RevokeArgs),
+}
+
+#[derive(Debug, Args)]
+struct KeyCreateArgs {
+    #[command(flatten)]
+    wallet: WalletArgs,
+
+    #[arg(long)]
+    label: String,
+
+    #[arg(long, required = true)]
+    relay: Vec<String>,
+
+    /// Sats moved into the key's pocket now (the most it can spend before a
+    /// refill).
+    #[arg(long)]
+    budget: u64,
+
+    /// Most the main wallet refills this key per --window, in sats
+    /// (0 = never refill).
+    #[arg(long, default_value_t = 0)]
+    cap: u64,
+
+    /// Rolling refill window, e.g. `1d`, `12h`.
+    #[arg(long, default_value = "1d")]
+    window: String,
+
+    /// Auto-refill at or below this many sats (default: half the budget
+    /// when --cap > 0).
+    #[arg(long)]
+    refill_below: Option<u64>,
+
+    /// Auto-refill up to this many sats (default: the budget).
+    #[arg(long)]
+    refill_to: Option<u64>,
+
+    /// Largest invoice the pocket pays for this key, in sats.
+    #[arg(long)]
+    max_per_payment: Option<u64>,
+
+    /// Relative expiry, e.g. `10m`, `12h`, `7d`. Afterwards the key is
+    /// refused and `serve` sweeps its pocket home.
+    #[arg(long)]
+    expires: Option<String>,
+
+    /// Comma-separated models the key may use (stored; enforced by the
+    /// gateway, since a bolt11 does not carry the model).
+    #[arg(long)]
+    models: Option<String>,
+
+    #[arg(long, default_value = "get_info,get_balance,pay_invoice")]
+    methods: String,
+
+    /// Write the NWC URI here (0600) instead of printing it in the JSON.
+    #[arg(long)]
+    uri_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CallArgs {
+    /// File holding the NWC URI.
+    #[arg(long)]
+    uri_file: PathBuf,
+
+    /// `info`, `balance` or `pay`.
+    method: String,
+
+    /// Invoice for `pay`.
+    #[arg(long)]
+    invoice: Option<String>,
+
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -83,7 +175,7 @@ struct ServeArgs {
     network: Option<String>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct WalletArgs {
     #[arg(long)]
     mint_url: Option<String>,
@@ -132,7 +224,8 @@ struct CreateArgs {
 
     /// Give the link its own Cashu pocket. The link can then spend at most
     /// what the pocket holds; --budget-msat and --single-cap-msat are
-    /// ignored. Needs --mint-url, --wallet-db and a seed.
+    /// ignored (use --max-per-payment-sats). Needs --mint-url, --wallet-db
+    /// and a seed.
     #[arg(long)]
     pocket: bool,
 
@@ -160,6 +253,10 @@ struct CreateArgs {
     /// Auto-refill up to this many sats.
     #[arg(long, requires_all = ["pocket", "auto_refill_below_sats"])]
     auto_refill_to_sats: Option<u64>,
+
+    /// Largest invoice a pocket link may pay, in sats.
+    #[arg(long, requires = "pocket")]
+    max_per_payment_sats: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -367,6 +464,14 @@ fn policy_from_args(args: &CreateArgs) -> Result<ConnectionPolicy> {
     let expires_at = resolve_expiry(args.expires_at, args.expires_in.as_deref(), now_secs())?;
     if args.pocket {
         // The pocket balance is the spending bound; no shared-balance ledger.
+        // The per-payment cap is checked against invoice + fee reserve, so
+        // add the reserve to keep the cap in invoice terms.
+        if args.max_per_payment_sats == Some(0) {
+            bail!("--max-per-payment must be greater than zero");
+        }
+        let max_single_payment_msat = args
+            .max_per_payment_sats
+            .map(|sats| sats * MSAT_PER_SAT + args.fee_reserve_msat);
         return Ok(ConnectionPolicy {
             id: String::new(),
             name: args.name.clone(),
@@ -374,7 +479,7 @@ fn policy_from_args(args: &CreateArgs) -> Result<ConnectionPolicy> {
             allowed_methods,
             budget_msat: None,
             budget_period: BudgetPeriod::Never,
-            max_single_payment_msat: None,
+            max_single_payment_msat,
             max_fee_reserve_msat: args.fee_reserve_msat,
             fee_overage_msat: 0,
             expires_at,
@@ -511,12 +616,21 @@ async fn sweep(
     Ok(())
 }
 
+/// A newly created pocket link.
+struct CreatedPocket {
+    id: String,
+    uri: String,
+    index: u32,
+    funded_sat: u64,
+    cost_sat: u64,
+}
+
 async fn create_pocket(
     cli: &Cli,
     args: &CreateArgs,
     manager: &mut ConnectionManager<Backend>,
     main: &Wallet,
-) -> Result<()> {
+) -> Result<CreatedPocket> {
     let local = require_local_wallet(cli, &args.wallet)?;
     let (ceiling_msat, refill) = pocket_limits(args)?;
     let registry = PocketRegistry::new(pockets_path(cli))?;
@@ -536,13 +650,200 @@ async fn create_pocket(
         swept_at: None,
     })?;
     let pocket = open_pocket_for(&local, index).await?;
+    let (mut funded_sat, mut cost_sat) = (0, 0);
     if args.pocket_sats > 0 {
         let (cost, received) =
             transfer_to_pocket(main, &pocket, Amount::from(args.pocket_sats), None).await?;
         eprintln!("pocket #{index} funded with {received} sat (cost {cost} sat)");
+        funded_sat = u64::from(received);
+        cost_sat = u64::from(cost);
     }
-    println!("connection_id={id}");
-    println!("{uri}");
+    Ok(CreatedPocket {
+        id,
+        uri,
+        index,
+        funded_sat,
+        cost_sat,
+    })
+}
+
+fn key_to_create_args(args: &KeyCreateArgs) -> Result<CreateArgs> {
+    let (below, to) = match (args.refill_below, args.refill_to) {
+        (Some(below), Some(to)) => (Some(below), Some(to)),
+        (None, None) if args.cap > 0 => (Some(args.budget / 2), Some(args.budget)),
+        (None, None) => (None, None),
+        (below, to) => (
+            Some(below.unwrap_or(args.budget / 2)),
+            Some(to.unwrap_or(args.budget)),
+        ),
+    };
+    if args.budget == 0 {
+        bail!("--budget must be greater than zero");
+    }
+    Ok(CreateArgs {
+        wallet: args.wallet.clone(),
+        name: args.label.clone(),
+        relay: args.relay.clone(),
+        budget_msat: 0,
+        methods: args.methods.clone(),
+        single_cap_msat: 0,
+        fee_reserve_msat: 0,
+        budget_period: "never".to_owned(),
+        expires_at: None,
+        expires_in: args.expires.clone(),
+        pocket: true,
+        pocket_sats: args.budget,
+        ceiling_sats: None,
+        refill_cap_sats: args.cap,
+        refill_window: args.window.clone(),
+        auto_refill_below_sats: below,
+        auto_refill_to_sats: to,
+        max_per_payment_sats: args.max_per_payment,
+    })
+}
+
+async fn key_create(cli: &Cli, args: &KeyCreateArgs) -> Result<()> {
+    let create = key_to_create_args(args)?;
+    let (mut manager, main) = build_manager(cli, &create.wallet, None).await?;
+    let main = main.context("keys need a local wallet")?;
+    let created = create_pocket(cli, &create, &mut manager, &main).await?;
+    let models = parse_list(args.models.as_deref());
+    save_key(
+        &keys_path(&cli.policy),
+        KeyMeta {
+            key_id: created.id.clone(),
+            label: args.label.clone(),
+            allowed_models: models.clone(),
+            max_per_payment_sats: args.max_per_payment,
+            created_at: now_secs(),
+        },
+    )?;
+    let uri = relay_first(&created.uri);
+    let mut out = serde_json::json!({
+        "key_id": created.id,
+        "label": args.label,
+        "pocket_index": created.index,
+        "budget_sat": created.funded_sat,
+        "funding_cost_sat": created.cost_sat,
+        "refill_cap_sat": args.cap,
+        "refill_window": args.window,
+        "auto_refill": create.auto_refill_below_sats.map(|below| serde_json::json!({
+            "below_sat": below,
+            "to_sat": create.auto_refill_to_sats,
+        })),
+        "max_per_payment_sat": args.max_per_payment,
+        "expires_at": resolve_expiry(None, args.expires.as_deref(), now_secs())?,
+        "allowed_models": models,
+        "methods": parse_list(Some(&args.methods)),
+    });
+    match &args.uri_out {
+        Some(path) => {
+            write_private(path, uri.as_bytes())?;
+            out["nwc_uri_file"] = serde_json::json!(path);
+        }
+        None => out["nwc_uri"] = serde_json::json!(uri),
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+async fn key_list(cli: &Cli, args: &PocketsArgs) -> Result<()> {
+    let registry = PocketRegistry::new(pockets_path(cli))?;
+    let policies = PolicyStore::new(&cli.policy)?.connections()?;
+    let metas = load_keys(&keys_path(&cli.policy))?;
+    let local = local_wallet(&args.wallet)?;
+    let now = now_secs();
+    let mut rows = Vec::new();
+    for meta in metas {
+        let Ok(config) = registry.get(&meta.key_id) else {
+            continue;
+        };
+        let policy = policies.iter().find(|p| p.id == meta.key_id);
+        let status = match policy {
+            _ if config.swept_at.is_some() && policy.is_some_and(|p| p.revoked) => "revoked",
+            _ if config.swept_at.is_some() => "closed",
+            None => "missing",
+            Some(p) if p.revoked => "revoked",
+            Some(p) if p.expires_at.is_some_and(|at| now >= at) => "expired",
+            Some(_) => "active",
+        };
+        let balance_sat = match &local {
+            Some(local) => Some(u64::from(
+                open_pocket_for(local, config.index)
+                    .await?
+                    .total_balance()
+                    .await?,
+            )),
+            None => None,
+        };
+        rows.push(serde_json::json!({
+            "key_id": meta.key_id,
+            "label": meta.label,
+            "status": status,
+            "balance_sat": balance_sat,
+            "ceiling_sat": config.ceiling_msat / MSAT_PER_SAT,
+            "refill_cap_sat": config.refill.cap_msat / MSAT_PER_SAT,
+            "refill_window_secs": config.refill.window_secs,
+            "refill_remaining_sat": registry.remaining_msat(&meta.key_id, now)? / MSAT_PER_SAT,
+            "max_per_payment_sat": meta.max_per_payment_sats,
+            "expires_at": policy.and_then(|p| p.expires_at),
+            "allowed_models": meta.allowed_models,
+            "swept_at": config.swept_at,
+        }));
+    }
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+async fn revoke(cli: &Cli, args: &RevokeArgs) -> Result<()> {
+    ConnectionManager::<Backend>::revoke_policy(&cli.policy, &args.id)?;
+    println!("revoked {}", args.id);
+    let registry = PocketRegistry::new(pockets_path(cli))?;
+    if let Ok(config) = registry.get(&args.id) {
+        if config.swept_at.is_some() {
+            println!("pocket already swept");
+        } else if let Some(local) = local_wallet(&args.wallet)? {
+            sweep(&local, &registry, &args.id, true).await?;
+        } else {
+            println!(
+                "pocket not swept: pass --mint-url, --wallet-db and a seed, \
+                 or let `serve` sweep it"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn call(args: &CallArgs) -> Result<()> {
+    let uri = fs::read_to_string(&args.uri_file).context("read NWC URI file")?;
+    let client = ForwardingNwcHandler::from_uri(uri.trim(), Duration::from_secs(args.timeout_secs))
+        .context("parse NWC URI")?;
+    let result = match args.method.as_str() {
+        "info" => client
+            .get_info()
+            .await
+            .map(|info| serde_json::to_value(info).unwrap_or_default()),
+        "balance" => client
+            .get_balance()
+            .await
+            .map(|balance| serde_json::json!({ "balance_msat": balance.balance })),
+        "pay" => {
+            let invoice = args.invoice.clone().context("pay needs --invoice")?;
+            client
+                .pay_invoice(PayInvoiceRequest::new(invoice))
+                .await
+                .map(|paid| serde_json::json!({ "paid": true, "fees_paid_msat": paid.fees_paid }))
+        }
+        other => bail!("unknown method {other:?}; use info, balance or pay"),
+    };
+    let out = match result {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "error": format!("{:?}", error.code),
+            "message": error.message,
+        }),
+    };
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
@@ -666,7 +967,9 @@ async fn main() -> Result<()> {
             let (mut manager, main) = build_manager(&cli, &args.wallet, None).await?;
             if args.pocket {
                 let main = main.context("pockets need a local wallet")?;
-                create_pocket(&cli, args, &mut manager, &main).await?;
+                let created = create_pocket(&cli, args, &mut manager, &main).await?;
+                println!("connection_id={}", created.id);
+                println!("{}", created.uri);
             } else {
                 let policy = policy_from_args(args)?;
                 let uri =
@@ -684,23 +987,7 @@ async fn main() -> Result<()> {
             let records = ConnectionManager::<Backend>::list_records(&cli.manager)?;
             println!("{}", serde_json::to_string_pretty(&records)?);
         }
-        Command::Revoke(args) => {
-            ConnectionManager::<Backend>::revoke_policy(&cli.policy, &args.id)?;
-            println!("revoked {}", args.id);
-            let registry = PocketRegistry::new(pockets_path(&cli))?;
-            if let Ok(config) = registry.get(&args.id) {
-                if config.swept_at.is_some() {
-                    println!("pocket already swept");
-                } else if let Some(local) = local_wallet(&args.wallet)? {
-                    sweep(&local, &registry, &args.id, true).await?;
-                } else {
-                    println!(
-                        "pocket not swept: pass --mint-url, --wallet-db and a seed, \
-                         or let `serve` sweep it"
-                    );
-                }
-            }
-        }
+        Command::Revoke(args) => revoke(&cli, args).await?,
         Command::Serve(args) => serve(&cli, args).await?,
         Command::Topup(args) => {
             let local = require_local_wallet(&cli, &args.wallet)?;
@@ -747,6 +1034,10 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
+        Command::Key(KeyCommand::Create(args)) => key_create(&cli, args).await?,
+        Command::Key(KeyCommand::List(args)) => key_list(&cli, args).await?,
+        Command::Key(KeyCommand::Revoke(args)) => revoke(&cli, args).await?,
+        Command::Call(args) => call(args).await?,
         Command::Pockets(args) => {
             let registry = PocketRegistry::new(pockets_path(&cli))?;
             let local = local_wallet(&args.wallet)?;

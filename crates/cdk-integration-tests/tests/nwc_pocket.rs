@@ -275,6 +275,42 @@ async fn auto_refill_is_capped_by_rolling_window() {
     assert!(granted > 0);
 }
 
+/// A refill larger than the main balance sends what main holds instead of
+/// failing, so a partial grant at the end of the cap is not wasted.
+#[tokio::test]
+async fn refill_sends_what_main_holds() {
+    setup_tracing();
+    let mint = create_and_start_in_memory_test_mint_with_fee(100)
+        .await
+        .expect("mint");
+    let policy = RefillPolicy {
+        cap_msat: 100 * SAT,
+        window_secs: 3_600,
+        auto_refill: None,
+    };
+    let s = setup(mint, 40, 0, policy).await;
+    let main_start = sats(&s.main).await;
+    let refiller = Refiller::new(Arc::clone(&s.main), s.registry.clone());
+
+    let added = refiller
+        .refill("agent", &s.pocket, 60 * SAT, now())
+        .await
+        .expect("partial refill from a short main wallet");
+    let main_left = sats(&s.main).await;
+    assert!(added > 0, "something must land");
+    assert_eq!(sats(&s.pocket).await * SAT, added);
+    assert!(
+        main_left < 5,
+        "main should be nearly empty, has {main_left}"
+    );
+    // The cap is charged the real cost only.
+    let used = 100 * SAT
+        - s.registry
+            .remaining_msat("agent", now())
+            .expect("remaining");
+    assert_eq!(used, (main_start - main_left) * SAT);
+}
+
 /// `fees_paid` is the real drop in pocket balance minus the invoice amount.
 #[tokio::test]
 async fn fee_accounting_is_pocket_balance_drop() {
