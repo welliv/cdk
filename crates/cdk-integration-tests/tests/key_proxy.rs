@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use cdk::amount::SplitTarget;
 use cdk::cdk_database::{self, WalletDatabase};
 use cdk::nuts::CurrencyUnit;
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet, WalletBuilder};
@@ -588,7 +589,14 @@ async fn key_proxy_enforces_every_rule_and_books_balance() {
     );
     assert!(b_paid >= 2);
     let b_left = sats(lab.pocket("b")).await;
-    assert!(b_left < 46);
+    // Exhausted: no set of B's proofs is worth 45 after the input fee.
+    let b_proofs = lab.pocket("b").get_unspent_proofs().await.expect("proofs");
+    let b_fee = (b_proofs.len() as u64 * FEE_PPK).div_ceil(1000);
+    assert!(
+        b_left.saturating_sub(b_fee) < 45,
+        "b_left {b_left}: {}",
+        last.body
+    );
 
     // Refill cap: A refills from main, within 60 sat, then stops.
     let main_before = sats(&lab.main).await;
@@ -697,7 +705,7 @@ async fn bundles_send_offline_without_a_swap() {
 
     // Loose proofs: one re-bundle swap, cutting bundles for later requests.
     let before = sats(&wallet).await;
-    let first = take_exact(&wallet, 45).await.expect("take");
+    let first = take_exact(&wallet, 45, 46).await.expect("take");
     let drop = before - sats(&wallet).await;
     if first.swapped {
         assert!(drop > bundle.total_sat);
@@ -708,7 +716,7 @@ async fn bundles_send_offline_without_a_swap() {
     // Then bundles go out offline: the drop is exactly one bundle.
     for _ in 0..3 {
         let before = sats(&wallet).await;
-        let taken = take_offline(&wallet, 45)
+        let taken = take_offline(&wallet, 45, 46)
             .await
             .expect("offline")
             .expect("a bundle is ready");
@@ -721,10 +729,25 @@ async fn bundles_send_offline_without_a_swap() {
     let small = wallet_on(&mint, random_seed()).await;
     fund_wallet(&small, 20, None).await.expect("fund");
     assert!(matches!(
-        take_exact(&small, 45).await,
+        take_exact(&small, 45, 46).await,
         Err(cdk::Error::InsufficientFunds)
     ));
     assert_eq!(sats(&small).await, 20);
+
+    // No exact bundle, but one 64 proof: sent as it is (overpaying, no swap)
+    // only when its value fits the per-request cap.
+    let one = wallet_on(&mint, random_seed()).await;
+    fund_wallet(&one, 64, Some(SplitTarget::Values(vec![Amount::from(64)])))
+        .await
+        .expect("fund");
+    assert!(take_offline(&one, 45, 60).await.expect("offline").is_none());
+    let taken = take_offline(&one, 45, 63)
+        .await
+        .expect("offline")
+        .expect("overpay within the cap");
+    assert!(!taken.swapped);
+    assert_eq!(taken.token_sat, 64);
+    assert_eq!(sats(&one).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

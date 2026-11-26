@@ -154,14 +154,22 @@ pub struct Taken {
 ///
 /// 1. Offline: if the pocket holds proofs adding up to the bundle, they are
 ///    sent as they are. No mint call.
-/// 2. Otherwise one re-bundle swap turns all loose proofs into up to
+/// 2. Offline, overpaying: the smallest set of loose proofs worth at least
+///    the price, if its value after fees stays within `max_net_sat` (the
+///    key's per-request cap). The provider returns the rest as change, which
+///    is swapped anyway, so this costs nothing a swap would not.
+/// 3. Otherwise one re-bundle swap turns all loose proofs into up to
 ///    [`MAX_BUNDLES`] bundles plus change, and step 1 runs again.
 ///
 /// Returns `InsufficientFunds` without touching the mint when the pocket
 /// cannot cover one bundle.
-pub async fn take_exact(wallet: &Wallet, price_sat: u64) -> Result<Taken, cdk::Error> {
+pub async fn take_exact(
+    wallet: &Wallet,
+    price_sat: u64,
+    max_net_sat: u64,
+) -> Result<Taken, cdk::Error> {
     let bundle = bundle_for(wallet, price_sat).await?;
-    if let Some(taken) = send_offline(wallet, &bundle).await? {
+    if let Some(taken) = take_ready(wallet, &bundle, price_sat, max_net_sat).await? {
         return Ok(taken);
     }
     let proofs = wallet.get_unspent_proofs().await?;
@@ -191,9 +199,86 @@ pub async fn take_exact(wallet: &Wallet, price_sat: u64) -> Result<Taken, cdk::E
 
 /// Send one bundle for `price_sat` only if it is ready: no mint call at
 /// all. `None` when the pocket has no exact bundle (or too little).
-pub async fn take_offline(wallet: &Wallet, price_sat: u64) -> Result<Option<Taken>, cdk::Error> {
+pub async fn take_offline(
+    wallet: &Wallet,
+    price_sat: u64,
+    max_net_sat: u64,
+) -> Result<Option<Taken>, cdk::Error> {
     let bundle = bundle_for(wallet, price_sat).await?;
-    send_offline(wallet, &bundle).await
+    take_ready(wallet, &bundle, price_sat, max_net_sat).await
+}
+
+/// Steps 1 and 2 of [`take_exact`]: no mint call.
+async fn take_ready(
+    wallet: &Wallet,
+    bundle: &Bundle,
+    price_sat: u64,
+    max_net_sat: u64,
+) -> Result<Option<Taken>, cdk::Error> {
+    if let Some(taken) = send_offline(wallet, bundle).await? {
+        return Ok(Some(taken));
+    }
+    let ppk = wallet.get_keyset_fees_by_id(bundle.keyset_id).await?;
+    let unspent: Proofs = wallet
+        .get_unspent_proofs()
+        .await?
+        .into_iter()
+        .filter(|p| p.keyset_id == bundle.keyset_id)
+        .collect();
+    let amounts: Vec<u64> = unspent.iter().map(|p| u64::from(p.amount)).collect();
+    let Some(chosen) = overpay_set(&amounts, ppk, price_sat, max_net_sat.max(bundle.send_sat))
+    else {
+        return Ok(None);
+    };
+    let picked: Proofs = chosen.into_iter().map(|i| unspent[i].clone()).collect();
+    send_picked(wallet, picked).await.map(Some)
+}
+
+/// The cheapest subset of `amounts` (indices) whose value after the input
+/// fee (`ppk` per input, rounded up) is at least `price_sat` and at most
+/// `max_net_sat`: the smallest total, then the fewest inputs.
+pub fn overpay_set(
+    amounts: &[u64],
+    ppk: u64,
+    price_sat: u64,
+    max_net_sat: u64,
+) -> Option<Vec<usize>> {
+    let fee = |n: usize| (n as u64 * ppk).div_ceil(1000);
+    let limit = usize::try_from(max_net_sat.saturating_add(fee(amounts.len()))).ok()?;
+    // best[s] = fewest inputs reaching total s; take[i][s]: item i used.
+    let mut best: Vec<Option<usize>> = vec![None; limit + 1];
+    best[0] = Some(0);
+    let mut take = vec![vec![false; limit + 1]; amounts.len()];
+    for (i, &a) in amounts.iter().enumerate() {
+        let a = usize::try_from(a).ok()?;
+        if a > limit {
+            continue;
+        }
+        for s in (a..=limit).rev() {
+            if let Some(n) = best[s - a] {
+                if best[s].is_none_or(|m| n + 1 < m) {
+                    best[s] = Some(n + 1);
+                    take[i][s] = true;
+                }
+            }
+        }
+    }
+    let total = (1..=limit).find(|&s| {
+        best[s].is_some_and(|n| {
+            let net = (s as u64).saturating_sub(fee(n));
+            net >= price_sat && net <= max_net_sat
+        })
+    })?;
+    // Walk back: the last item that improved a total is the one used for it.
+    let mut chosen = Vec::new();
+    let mut s = total;
+    for i in (0..amounts.len()).rev() {
+        if s > 0 && take[i][s] {
+            chosen.push(i);
+            s -= amounts[i] as usize;
+        }
+    }
+    (s == 0 && !chosen.is_empty()).then_some(chosen)
 }
 
 /// Pick one unspent proof per bundle denomination (active keyset only) and
@@ -215,6 +300,11 @@ async fn send_offline(wallet: &Wallet, bundle: &Bundle) -> Result<Option<Taken>,
         };
         picked.push(unspent.swap_remove(position));
     }
+    send_picked(wallet, picked).await.map(Some)
+}
+
+/// Mark `picked` `PendingSpent` and encode them as a token.
+async fn send_picked(wallet: &Wallet, picked: Proofs) -> Result<Taken, cdk::Error> {
     wallet
         .localstore
         .update_proofs_state(picked.ys()?, State::PendingSpent)
@@ -225,12 +315,12 @@ async fn send_offline(wallet: &Wallet, bundle: &Bundle) -> Result<Option<Taken>,
         None,
         wallet.unit.clone(),
     );
-    Ok(Some(Taken {
+    Ok(Taken {
         token_sat: u64::from(picked.total_amount()?),
         token: token.to_string(),
         swapped: false,
         proofs: picked,
-    }))
+    })
 }
 
 /// The provider redeemed a token we sent: drop its proofs from the pocket.
@@ -312,6 +402,32 @@ mod tests {
             SplitTarget::Values(v) => v.into_iter().map(u64::from).collect(),
             _ => vec![],
         }
+    }
+
+    #[test]
+    fn overpay_picks_the_cheapest_set_within_the_cap() {
+        let sum = |a: &[u64], i: &[usize]| i.iter().map(|&i| a[i]).sum::<u64>();
+        // No exact [32, 8, 4, 2]: 64 alone (net 63) beats 32+16+... sets.
+        let a = [64, 1, 128];
+        let i = overpay_set(&a, 100, 45, 100).expect("set");
+        assert_eq!(sum(&a, &i), 64);
+        // Cap 60: 64 nets 63 > 60, so nothing (the caller swaps instead).
+        assert_eq!(overpay_set(&a, 100, 45, 60), None);
+        // 32 + 16 = 48 nets 47: smallest total that covers 45 + fee.
+        let a = [32, 16, 16, 2, 1];
+        let i = overpay_set(&a, 100, 45, 60).expect("set");
+        assert_eq!(sum(&a, &i), 48);
+        // Exactly price + fee is reachable: 32 + 8 + 4 + 2 = 46.
+        let a = [2, 4, 8, 32, 64];
+        let i = overpay_set(&a, 100, 45, 60).expect("set");
+        assert_eq!(sum(&a, &i), 46);
+        assert_eq!(i.len(), 4);
+        // Too little.
+        assert_eq!(overpay_set(&[16, 8], 100, 45, 60), None);
+        // Fees count: 11 inputs at 100 ppk cost 2 sat.
+        let a = [4; 12];
+        let i = overpay_set(&a, 100, 40, 60).expect("set");
+        assert_eq!(sum(&a, &i), 44);
     }
 
     #[test]

@@ -444,10 +444,18 @@ async fn retry_parked(state: &ProxyState, key_id: &str, pocket: &Wallet) -> u64 
         let Ok(token) = std::fs::read_to_string(&path) else {
             continue;
         };
-        match pocket
-            .receive(token.trim(), ReceiveOptions::default())
-            .await
-        {
+        // Shaped like any change, so the next request can send offline.
+        let options = shaped(pocket, token.trim(), state.last_price(key_id)).await;
+        let targeted = options.amount_split_target != cdk::amount::SplitTarget::None;
+        let mut result = pocket.receive(token.trim(), options).await;
+        if let Err(error) = &result {
+            if targeted && !is_transient(error) && !matches!(error, cdk::Error::TokenAlreadySpent) {
+                result = pocket
+                    .receive(token.trim(), ReceiveOptions::default())
+                    .await;
+            }
+        }
+        match result {
             Ok(amount) => {
                 state.mint_ok();
                 received += u64::from(amount);
@@ -651,14 +659,21 @@ async fn take_for(state: &ProxyState, meta: &KeyMeta, price_sat: u64) -> Result<
     let pocket = state.pocket(config.index).await?;
     let before_sat = u64::from(pocket.total_balance().await?);
     let mut refilled_sat = 0;
+    // A token may carry more than the price (the provider returns the rest),
+    // but never more than the key's per-request cap: that bounds what one
+    // request can lose even to a dishonest provider.
+    let max_net_sat = meta
+        .max_per_payment_sats
+        .unwrap_or(price_sat.saturating_mul(2))
+        .max(price_sat);
     let taken = loop {
         let attempt = match state.mint_busy() {
             // Backoff: only an offline send, no mint call.
-            Some(secs) => match take_offline(&pocket, price_sat).await? {
+            Some(secs) => match take_offline(&pocket, price_sat, max_net_sat).await? {
                 Some(taken) => Ok(taken),
                 None => return Err(Outcome::Busy(secs)),
             },
-            None => take_exact(&pocket, price_sat).await,
+            None => take_exact(&pocket, price_sat, max_net_sat).await,
         };
         match attempt {
             Ok(taken) => break taken,
@@ -861,12 +876,15 @@ async fn pay_and_forward(
     let provider_kept_sat = paid.taken.token_sat.saturating_sub(change_face_sat);
     let cost_sat = paid.spent_sat.saturating_sub(change_sat);
     let balance_sat = u64::from(paid.pocket.total_balance().await?);
+    // Parked change lands later (the sweeper logs it): fees are not known yet.
+    let parked_sat = (landed == Landed::Parked).then_some(change_face_sat);
     log(json!({
         "key": meta.label, "model": model, "status": status, "price_sat": price_sat,
         "sent_sat": paid.taken.token_sat, "send_swap": paid.taken.swapped,
         "change_sat": change_sat, "change": format!("{landed:?}"),
+        "change_parked_sat": parked_sat,
         "provider_kept_sat": provider_kept_sat,
-        "mint_fees_sat": cost_sat.saturating_sub(provider_kept_sat),
+        "mint_fees_sat": parked_sat.is_none().then(|| cost_sat.saturating_sub(provider_kept_sat)),
         "cost_sat": cost_sat, "refilled_sat": paid.refilled_sat, "balance_sat": balance_sat,
     }));
 
@@ -1010,14 +1028,18 @@ async fn recover_pocket(state: &ProxyState, key_id: &str, restore: bool) -> Valu
         let pocket = state.pocket(config.index).await?;
         let report = pocket.recover_incomplete_sagas().await?;
         pocket.check_all_pending_proofs().await?;
+        // `restore().unspent` counts every proof the scan saw, including
+        // ones the pocket already had: report what the restore added.
         let restored = if restore {
-            u64::from(pocket.restore().await?.unspent)
+            let before = u64::from(pocket.total_balance().await?);
+            pocket.restore().await?;
+            u64::from(pocket.total_balance().await?).saturating_sub(before)
         } else {
             0
         };
         let parked = retry_parked(state, key_id, &pocket).await;
         Ok(
-            json!({ "sagas": format!("{report:?}"), "restored_unspent_sat": restored,
+            json!({ "sagas": format!("{report:?}"), "restored_sat": restored,
             "parked_received_sat": parked,
             "balance_sat": u64::from(pocket.total_balance().await?) }),
         )
