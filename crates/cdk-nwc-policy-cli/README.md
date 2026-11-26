@@ -159,3 +159,21 @@ nwc-policy-cli key revoke --id <key_id> [--mint-url ... --wallet-db ...]
 | allowed models | **not** the pocket (a bolt11 has no model); stored and exported by `key list` for the gateway to enforce |
 
 `call --uri-file F info|balance|pay --invoice X` drives a link as a client for testing.
+
+## Pay per request (`key proxy`)
+
+`key create` also issues an API key (`--api-key-out`, 0600; only its SHA-256 is stored).
+`key proxy --provider <routstr-core URL> --listen 127.0.0.1:8090` exposes an
+OpenAI-compatible endpoint. Each request with `Authorization: Bearer sk-pocket-…`:
+
+1. key revoked/expired → 401; model not on the key's list → 403 (no ecash moves);
+2. price = provider `/v1/models` `sats_pricing.max_cost` (rounded up); above the
+   key's `--max-per-payment` → 402 (no ecash moves);
+3. pocket short → refill from main within the refill cap, else 402 `budget_exhausted`;
+4. exactly `price` sats of this key's pocket are sent as `X-Cashu`;
+5. the provider's change (`X-Cashu` response header) is received back into the same
+   pocket; if the mint fails it is parked on disk and retried.
+
+Keys, policies and pockets are re-read per request (no restart for new or revoked
+keys); revoked/expired pockets are swept home by the proxy. `serve` now also starts
+connections created after it started.

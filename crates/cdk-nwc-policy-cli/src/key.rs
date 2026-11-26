@@ -28,6 +28,10 @@ pub struct KeyMeta {
     pub max_per_payment_sats: Option<u64>,
     /// Unix time the key was created.
     pub created_at: u64,
+    /// SHA-256 (hex) of the key's API key for `key proxy`. The API key itself
+    /// is shown once at creation and never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_sha256: Option<String>,
 }
 
 /// Default key metadata path, next to the policy ledger.
@@ -89,6 +93,20 @@ pub fn relay_first(uri: &str) -> String {
     format!("{base}?{}", parts.join("&"))
 }
 
+/// Generate an API key (`sk-pocket-<64 hex>`) and its SHA-256 hex digest.
+pub fn new_api_key() -> (String, String) {
+    let bytes: [u8; 32] = rand::random();
+    let key = format!("sk-pocket-{}", hex::encode(bytes));
+    let digest = api_key_digest(&key);
+    (key, digest)
+}
+
+/// SHA-256 hex digest of an API key.
+pub fn api_key_digest(key: &str) -> String {
+    use bitcoin::hashes::{sha256, Hash};
+    sha256::Hash::hash(key.as_bytes()).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +122,16 @@ mod tests {
             relay_first("nostr+walletconnect://abc"),
             "nostr+walletconnect://abc"
         );
+    }
+
+    #[test]
+    fn api_keys_are_unique_and_hashed() {
+        let (a, da) = new_api_key();
+        let (b, db) = new_api_key();
+        assert!(a.starts_with("sk-pocket-") && a.len() == 74);
+        assert_ne!(a, b);
+        assert_eq!(api_key_digest(&a), da);
+        assert_ne!(da, db);
     }
 
     #[test]
@@ -123,6 +151,7 @@ mod tests {
             allowed_models: vec!["m".into()],
             max_per_payment_sats: Some(200),
             created_at: 1,
+            api_key_sha256: None,
         };
         save_key(&path, meta.clone()).expect("save");
         save_key(&path, meta.clone()).expect("save again");

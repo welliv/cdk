@@ -24,11 +24,12 @@ use cdk_nwc_pocket::{
 use cdk_nwc_policy::manager::ConnectionManager;
 use cdk_nwc_policy::{BudgetPeriod, ConnectionPolicy, PolicyStore};
 use cdk_nwc_policy_cli::key::{
-    keys_path, load_keys, parse_list, relay_first, save_key, write_private, KeyMeta,
+    keys_path, load_keys, new_api_key, parse_list, relay_first, save_key, write_private, KeyMeta,
 };
 use cdk_nwc_policy_cli::pocket::{
     maintain_pockets, open_pocket, open_wallet, registry_path, DEFAULT_MAINTENANCE_INTERVAL,
 };
+use cdk_nwc_policy_cli::proxy::{self, ProxyConfig};
 use cdk_nwc_policy_cli::{
     parse_budget_period, parse_duration_secs, resolve_expiry, spawn_quote_claimer,
 };
@@ -85,6 +86,26 @@ enum KeyCommand {
     List(PocketsArgs),
     /// Revoke a key and sweep its pocket home.
     Revoke(RevokeArgs),
+    /// OpenAI-compatible proxy: each request is paid per request with ecash
+    /// from the calling key's pocket (X-Cashu), change goes back to it.
+    Proxy(ProxyArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProxyArgs {
+    #[command(flatten)]
+    wallet: WalletArgs,
+
+    /// Routstr provider base URL (routstr-core).
+    #[arg(long)]
+    provider: String,
+
+    #[arg(long, default_value = "127.0.0.1:8090")]
+    listen: String,
+
+    /// Seconds between sweeps of revoked/expired pockets.
+    #[arg(long, default_value_t = 10)]
+    sweep_interval_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +162,10 @@ struct KeyCreateArgs {
     /// Write the NWC URI here (0600) instead of printing it in the JSON.
     #[arg(long)]
     uri_out: Option<PathBuf>,
+
+    /// Write the API key for `key proxy` here (0600) instead of printing it.
+    #[arg(long)]
+    api_key_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -708,6 +733,7 @@ async fn key_create(cli: &Cli, args: &KeyCreateArgs) -> Result<()> {
     let main = main.context("keys need a local wallet")?;
     let created = create_pocket(cli, &create, &mut manager, &main).await?;
     let models = parse_list(args.models.as_deref());
+    let (api_key, api_key_sha256) = new_api_key();
     save_key(
         &keys_path(&cli.policy),
         KeyMeta {
@@ -716,6 +742,7 @@ async fn key_create(cli: &Cli, args: &KeyCreateArgs) -> Result<()> {
             allowed_models: models.clone(),
             max_per_payment_sats: args.max_per_payment,
             created_at: now_secs(),
+            api_key_sha256: Some(api_key_sha256),
         },
     )?;
     let uri = relay_first(&created.uri);
@@ -742,6 +769,13 @@ async fn key_create(cli: &Cli, args: &KeyCreateArgs) -> Result<()> {
             out["nwc_uri_file"] = serde_json::json!(path);
         }
         None => out["nwc_uri"] = serde_json::json!(uri),
+    }
+    match &args.api_key_out {
+        Some(path) => {
+            write_private(path, api_key.as_bytes())?;
+            out["api_key_file"] = serde_json::json!(path);
+        }
+        None => out["api_key"] = serde_json::json!(api_key),
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
@@ -847,21 +881,25 @@ async fn call(args: &CallArgs) -> Result<()> {
     Ok(())
 }
 
-async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
-    let (mut manager, wallet) = build_manager(cli, &args.wallet, args.network.clone()).await?;
+type PocketMap = Arc<std::sync::Mutex<HashMap<String, Arc<PocketNwcHandler>>>>;
+
+/// Start every connection with a policy that is not running yet. Returns how
+/// many were started.
+async fn start_new_connections(
+    cli: &Cli,
+    args: &ServeArgs,
+    manager: &mut ConnectionManager<Backend>,
+    refiller: &Option<Arc<Refiller>>,
+    pockets: &PocketMap,
+) -> Result<usize> {
     let registry = PocketRegistry::new(pockets_path(cli))?;
     let pocket_configs = registry.list()?;
     let local = local_wallet(&args.wallet)?;
     let policies = PolicyStore::new(&cli.policy)?.connections()?;
     let with_policy: HashSet<String> = policies.iter().map(|p| p.id.clone()).collect();
-
-    let refiller = wallet
-        .as_ref()
-        .map(|main| Arc::new(Refiller::new(Arc::clone(main), registry.clone())));
-    let mut pockets: HashMap<String, Arc<PocketNwcHandler>> = HashMap::new();
     let mut started = 0;
     for record in manager.list_connections() {
-        if !with_policy.contains(&record.id) {
+        if !with_policy.contains(&record.id) || manager.is_running(&record.id) {
             continue;
         }
         if let Some(config) = pocket_configs
@@ -878,7 +916,10 @@ async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
                 pocket,
                 refiller.clone(),
             )?);
-            pockets.insert(record.id.clone(), Arc::clone(&handler));
+            pockets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pocket map poisoned"))?
+                .insert(record.id.clone(), Arc::clone(&handler));
             manager
                 .start_with_inner(
                     &record.id,
@@ -890,11 +931,28 @@ async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
         }
         started += 1;
     }
+    Ok(started)
+}
+
+async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
+    let (mut manager, wallet) = build_manager(cli, &args.wallet, args.network.clone()).await?;
+    let registry = PocketRegistry::new(pockets_path(cli))?;
+
+    let refiller = wallet
+        .as_ref()
+        .map(|main| Arc::new(Refiller::new(Arc::clone(main), registry.clone())));
+    let pockets: PocketMap = Arc::default();
+    let started = start_new_connections(cli, args, &mut manager, &refiller, &pockets).await?;
     println!(
         "serving {started} connection(s), {} with a pocket",
-        pockets.len()
+        pockets.lock().map(|p| p.len()).unwrap_or(0)
     );
 
+    let interval = if args.claim_interval_secs > 0 {
+        Duration::from_secs(args.claim_interval_secs)
+    } else {
+        DEFAULT_MAINTENANCE_INTERVAL
+    };
     let mut background = Vec::new();
     if let Some(main) = wallet.clone() {
         if args.claim_interval_secs > 0 {
@@ -904,7 +962,7 @@ async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
             ));
         }
     }
-    if let (Some(main), Some(refiller)) = (wallet, refiller) {
+    if let (Some(main), Some(refiller)) = (wallet, refiller.clone()) {
         let mut events = refiller.subscribe();
         background.push(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
@@ -914,38 +972,58 @@ async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
                 }
             }
         }));
-        if !pockets.is_empty() {
-            let interval = if args.claim_interval_secs > 0 {
-                Duration::from_secs(args.claim_interval_secs)
-            } else {
-                DEFAULT_MAINTENANCE_INTERVAL
-            };
-            let policy_path = cli.policy.clone();
-            background.push(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    ticker.tick().await;
-                    let policies = match PolicyStore::new(&policy_path)
-                        .and_then(|store| store.connections())
-                    {
+        let policy_path = cli.policy.clone();
+        let pockets = Arc::clone(&pockets);
+        background.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let snapshot = match pockets.lock() {
+                    Ok(map) => map.clone(),
+                    Err(_) => continue,
+                };
+                if snapshot.is_empty() {
+                    continue;
+                }
+                let policies =
+                    match PolicyStore::new(&policy_path).and_then(|store| store.connections()) {
                         Ok(policies) => policies,
                         Err(error) => {
                             eprintln!("pocket maintenance: read policies: {error}");
                             continue;
                         }
                     };
-                    if let Err(error) =
-                        maintain_pockets(&main, &registry, &policies, &pockets, now_secs()).await
-                    {
-                        eprintln!("pocket maintenance failed: {error:#}");
-                    }
+                if let Err(error) =
+                    maintain_pockets(&main, &registry, &policies, &snapshot, now_secs()).await
+                {
+                    eprintln!("pocket maintenance failed: {error:#}");
                 }
-            }));
-        }
+            }
+        }));
     }
 
-    let signal = tokio::signal::ctrl_c().await;
+    // Pick up connections created after start-up (no restart needed).
+    let mut rescan = tokio::time::interval(interval);
+    rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    rescan.tick().await;
+    let signal = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => break signal,
+            _ = rescan.tick() => {
+                let result = async {
+                    manager.reload()?;
+                    start_new_connections(cli, args, &mut manager, &refiller, &pockets).await
+                }
+                .await;
+                match result {
+                    Ok(0) => {}
+                    Ok(started) => println!("started {started} new connection(s)"),
+                    Err(error) => eprintln!("connection rescan failed: {error:#}"),
+                }
+            }
+        }
+    };
     for task in background {
         task.abort();
     }
@@ -957,6 +1035,9 @@ async fn serve(cli: &Cli, args: &ServeArgs) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // reqwest (key proxy) pulls in aws-lc-rs next to the ring provider the
+    // Nostr relay client uses; pick one so rustls does not panic.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     if cli.manager == cli.policy {
         bail!("--manager and --policy must be different paths");
@@ -1037,6 +1118,21 @@ async fn main() -> Result<()> {
         Command::Key(KeyCommand::Create(args)) => key_create(&cli, args).await?,
         Command::Key(KeyCommand::List(args)) => key_list(&cli, args).await?,
         Command::Key(KeyCommand::Revoke(args)) => revoke(&cli, args).await?,
+        Command::Key(KeyCommand::Proxy(args)) => {
+            let local = require_local_wallet(&cli, &args.wallet)?;
+            let main = open_main(&local).await?;
+            let config = ProxyConfig {
+                provider: args.provider.clone(),
+                policy_path: cli.policy.clone(),
+                pockets_path: pockets_path(&cli),
+                keys_path: keys_path(&cli.policy),
+                mint_url: local.mint_url.to_owned(),
+                wallet_db: local.wallet_db.to_path_buf(),
+                seed: local.seed,
+                sweep_interval: Duration::from_secs(args.sweep_interval_secs.max(1)),
+            };
+            proxy::run(config, main, &args.listen).await?;
+        }
         Command::Call(args) => call(args).await?,
         Command::Pockets(args) => {
             let registry = PocketRegistry::new(pockets_path(&cli))?;

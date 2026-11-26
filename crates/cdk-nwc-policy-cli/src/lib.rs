@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 pub mod key;
 pub mod pocket;
+pub mod proxy;
 
 /// Parse a `--budget-period` value.
 pub fn parse_budget_period(value: &str) -> Result<BudgetPeriod> {

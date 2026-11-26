@@ -217,6 +217,15 @@ where
         Ok(uri)
     }
 
+    /// Re-read connection records from disk, picking up connections created
+    /// by other processes. Running services are left alone.
+    pub fn reload(&mut self) -> Result<(), ManagerError> {
+        let lock = open_lock(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(|error| ManagerError::Io(error.to_string()))?;
+        self.records = read_manager_file(&self.manager_path)?.connections;
+        Ok(())
+    }
+
     /// List full internal records.
     pub fn list_connections(&self) -> Vec<ConnectionRecord> {
         self.records.clone()

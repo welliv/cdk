@@ -15,6 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum = { workspace = true }
+bitcoin = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
 async-trait = { workspace = true }
 cdk = { workspace = true, features = ["wallet", "nwc"] }
 cdk-nostr = { workspace = true, features = ["nwc"] }
