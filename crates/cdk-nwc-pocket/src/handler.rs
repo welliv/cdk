@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use crate::error::Error;
 use crate::event::{OutOfFundsReason, PocketEvent};
 use crate::refill::Refiller;
+use crate::registry::{PocketRegistry, SpendLock};
 use crate::transfer::{balance_msat, ensure_sat, sweep_excess, sweep_pocket, SweepReport};
 
 /// Margin requested above the invoice amount when refilling for a payment,
@@ -40,6 +41,7 @@ pub struct PocketNwcHandler {
     inner: WalletNwcHandler,
     refiller: Option<Arc<Refiller>>,
     lock: Mutex<()>,
+    spend_lock: Option<PocketRegistry>,
     spent_msat: AtomicU64,
 }
 
@@ -58,10 +60,26 @@ impl PocketNwcHandler {
             connection_id,
             inner: WalletNwcHandler::new(Arc::clone(&wallet), None),
             wallet,
+            spend_lock: refiller.as_ref().map(|r| r.registry().clone()),
             refiller,
             lock: Mutex::new(()),
             spent_msat: AtomicU64::new(0),
         })
+    }
+
+    /// Hold the cross-process spend lock of this pocket (see
+    /// [`crate::SpendLock`]) around every payment and sweep. Set by default
+    /// from the refiller's registry; use this when there is no refiller.
+    pub fn with_spend_lock(mut self, registry: PocketRegistry) -> Self {
+        self.spend_lock = Some(registry);
+        self
+    }
+
+    async fn hold_spend(&self) -> Result<Option<SpendLock>, Error> {
+        match &self.spend_lock {
+            Some(registry) => Ok(Some(registry.lock_spend(&self.connection_id).await?)),
+            None => Ok(None),
+        }
     }
 
     /// The connection this pocket belongs to.
@@ -84,6 +102,7 @@ impl PocketNwcHandler {
     /// in-flight payment on this pocket to finish first.
     pub async fn sweep_to(&self, main: &Wallet) -> Result<SweepReport, Error> {
         let _guard = self.lock.lock().await;
+        let _spend = self.hold_spend().await?;
         sweep_pocket(&self.wallet, main).await
     }
 
@@ -95,6 +114,7 @@ impl PocketNwcHandler {
         ceiling_msat: u64,
     ) -> Result<(u64, u64), Error> {
         let _guard = self.lock.lock().await;
+        let _spend = self.hold_spend().await?;
         let claimed = u64::from(self.wallet.mint_unissued_quotes().await?)
             .saturating_mul(crate::MSAT_PER_SAT);
         let moved = sweep_excess(&self.wallet, main, ceiling_msat).await?;
@@ -230,6 +250,7 @@ impl NwcRequestHandler for PocketNwcHandler {
             .unwrap_or(0);
 
         let guard = self.lock.lock().await;
+        let _spend = self.hold_spend().await.map_err(internal)?;
         let first = self.pay_once(request.clone(), invoice_msat).await;
         let result = match first {
             Err(error) if error.code == ErrorCode::InsufficientBalance => {
@@ -280,6 +301,7 @@ impl NwcRequestHandler for PocketNwcHandler {
             }
             other => other,
         };
+        drop(_spend);
         drop(guard);
         if result.is_ok() {
             self.top_up_after_payment().await;

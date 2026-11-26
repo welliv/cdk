@@ -4,6 +4,9 @@
 //! cost is the keyset input fee. Sweeping swaps the pocket's proofs into the
 //! main wallet, so any copy of those proofs becomes worthless at the mint.
 
+use std::time::Duration;
+
+use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::ProofsMethods;
 use cdk::nuts::{CurrencyUnit, Proofs};
 use cdk::wallet::{ReceiveOptions, SendOptions};
@@ -42,6 +45,63 @@ pub async fn balance_msat(wallet: &Wallet) -> Result<u64, Error> {
     Ok(u64::from(wallet.total_balance().await?).saturating_mul(MSAT_PER_SAT))
 }
 
+/// Whether a mint error may go away if the same request is sent again: a
+/// rate limit (429), a server error (5xx) or a transport failure. A rejected
+/// request moved no value and cost no fee, so retrying it later is free.
+pub fn is_transient(error: &cdk::Error) -> bool {
+    match error {
+        cdk::Error::HttpError(Some(status), _) => *status == 429 || *status >= 500,
+        cdk::Error::HttpError(None, _)
+        | cdk::Error::Timeout
+        | cdk::Error::CouldNotGetMintInfo
+        | cdk::Error::UnknownErrorResponse(_) => true,
+        _ => false,
+    }
+}
+
+/// Backoff between receive attempts on a transient mint error.
+const RECEIVE_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(750),
+    Duration::from_millis(1_500),
+    Duration::from_millis(3_000),
+];
+
+/// Receive `token` into `wallet`, retrying the same swap on transient mint
+/// errors (no new fee: a refused swap costs nothing).
+///
+/// If a retry finds the token already spent, an earlier attempt reached the
+/// mint but its reply was lost. The outputs were derived from the wallet's
+/// seed, so a NUT-09/13 restore gets them back; the restored value is
+/// returned.
+pub async fn receive_with_retry(
+    wallet: &Wallet,
+    token: &str,
+    options: ReceiveOptions,
+) -> Result<Amount, cdk::Error> {
+    let mut transient_seen = false;
+    let mut delays = RECEIVE_BACKOFF.iter();
+    loop {
+        match wallet.receive(token, options.clone()).await {
+            Ok(amount) => return Ok(amount),
+            Err(cdk::Error::TokenAlreadySpent) if transient_seen => {
+                tracing::warn!("receive reply was lost; restoring from seed");
+                let before = wallet.total_balance().await?;
+                wallet.restore().await?;
+                let after = wallet.total_balance().await?;
+                return Ok(after.checked_sub(before).unwrap_or(Amount::ZERO));
+            }
+            Err(error) if is_transient(&error) => {
+                transient_seen = true;
+                match delays.next() {
+                    Some(delay) => tokio::time::sleep(*delay).await,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Move up to `amount` sats from `main` into `pocket`.
 ///
 /// The main wallet pays the swap fees, so the pocket receives the amount
@@ -55,6 +115,22 @@ pub async fn transfer_to_pocket(
     pocket: &Wallet,
     amount: Amount,
     max_cost: Option<Amount>,
+) -> Result<(Amount, Amount), Error> {
+    transfer_to_pocket_split(main, pocket, amount, max_cost, |_| SplitTarget::None).await
+}
+
+/// [`transfer_to_pocket`], choosing how the pocket splits what it receives.
+///
+/// `split` gets the amount the pocket will receive and returns the target
+/// denominations (see [`SplitTarget::Values`]); the pocket's receive swap
+/// happens anyway, so shaping its outputs is free. A target that does not
+/// fit falls back to the default split.
+pub async fn transfer_to_pocket_split(
+    main: &Wallet,
+    pocket: &Wallet,
+    amount: Amount,
+    max_cost: Option<Amount>,
+    split: impl Fn(Amount) -> SplitTarget,
 ) -> Result<(Amount, Amount), Error> {
     ensure_sat(main)?;
     ensure_sat(pocket)?;
@@ -101,12 +177,29 @@ pub async fn transfer_to_pocket(
         }
         return Err(Error::RefillCapReached);
     };
+    let sent = prepared.amount();
     let token = prepared.confirm(None).await?.to_string();
-    match pocket.receive(&token, ReceiveOptions::default()).await {
+    let target = split(sent);
+    let shaped = ReceiveOptions {
+        amount_split_target: target.clone(),
+        ..Default::default()
+    };
+    let first = match receive_with_retry(pocket, &token, shaped).await {
+        // A target that does not fit fails locally, before the mint is asked.
+        Err(error) if target != SplitTarget::None && !is_transient(&error) => {
+            tracing::debug!("split target refused ({error}); using the default split");
+            receive_with_retry(pocket, &token, ReceiveOptions::default()).await
+        }
+        other => other,
+    };
+    match first {
         Ok(received) => Ok((cost, received)),
         Err(error) => {
-            // Put the value back rather than leaving an unclaimed token.
-            if let Err(reclaim) = main.receive(&token, ReceiveOptions::default()).await {
+            // Put the value back rather than leaving an unclaimed token. The
+            // receive above already retried transient errors, so this runs
+            // once, not in a loop.
+            if let Err(reclaim) = receive_with_retry(main, &token, ReceiveOptions::default()).await
+            {
                 tracing::error!("failed to reclaim pocket transfer: {}", reclaim);
             }
             Err(error.into())

@@ -31,9 +31,14 @@ pub use self::error::Error;
 pub use self::event::{OutOfFundsReason, PocketEvent};
 pub use self::handler::PocketNwcHandler;
 pub use self::refill::Refiller;
-pub use self::registry::{AutoRefill, PocketConfig, PocketRegistry, RefillPolicy};
+pub use self::registry::{
+    AutoRefill, PocketConfig, PocketRegistry, RefillPolicy, SpendLock, MAIN_SPEND_LOCK,
+};
 pub use self::seed::derive_pocket_seed;
-pub use self::transfer::{sweep_excess, sweep_pocket, transfer_to_pocket, SweepReport};
+pub use self::transfer::{
+    is_transient, receive_with_retry, sweep_excess, sweep_pocket, transfer_to_pocket,
+    transfer_to_pocket_split, SweepReport,
+};
 
 /// Millisatoshis per satoshi.
 pub const MSAT_PER_SAT: u64 = 1_000;

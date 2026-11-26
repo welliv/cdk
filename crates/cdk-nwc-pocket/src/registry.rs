@@ -71,6 +71,21 @@ struct RegistryFile {
     next_grant_id: u64,
 }
 
+/// Name of the spend lock that guards the main wallet's proofs.
+pub const MAIN_SPEND_LOCK: &str = "main";
+
+/// An exclusive, cross-process hold on spending one wallet's proofs.
+///
+/// `serve` (NWC) and `key proxy` may run at the same time on the same
+/// pocket files. Every operation that selects proofs to spend (a payment, a
+/// send, a refill from main, a sweep) holds this lock, so two processes never
+/// pick the same proofs. It is an OS file lock: it is released when the value
+/// is dropped or the process dies.
+#[derive(Debug)]
+pub struct SpendLock {
+    _file: File,
+}
+
 /// File-backed pocket registry.
 #[derive(Debug, Clone)]
 pub struct PocketRegistry {
@@ -92,6 +107,50 @@ impl PocketRegistry {
         }
         let lock_path = path.with_extension("pockets.lock");
         Ok(Self { path, lock_path })
+    }
+
+    /// Take the spend lock for `name`: a connection ID for a pocket, or
+    /// [`MAIN_SPEND_LOCK`] for the main wallet. Waits while another task or
+    /// process holds it. Lock order is always pocket, then main.
+    pub async fn lock_spend(&self, name: &str) -> Result<SpendLock, Error> {
+        let path = self.spend_lock_path(name);
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| Error::Io(e.to_string()))?;
+            FileExt::lock_exclusive(&file).map_err(|e| Error::Io(e.to_string()))?;
+            Ok(SpendLock { _file: file })
+        })
+        .await
+        .map_err(|e| Error::Io(e.to_string()))?
+    }
+
+    fn spend_lock_path(&self, name: &str) -> PathBuf {
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let prefix = if name == MAIN_SPEND_LOCK {
+            ""
+        } else {
+            "pocket-"
+        };
+        self.path
+            .with_extension("spend")
+            .join(format!("{prefix}{safe}.lock"))
     }
 
     /// Register a pocket. Fails if the connection ID or index is taken.

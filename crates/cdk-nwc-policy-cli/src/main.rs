@@ -624,6 +624,8 @@ async fn sweep(
     let config = registry.get(id)?;
     let main = open_main(local).await?;
     let pocket = open_pocket_for(local, config.index).await?;
+    // `serve` or `key proxy` may be spending this pocket right now.
+    let _spend = registry.lock_spend(id).await?;
     let report = sweep_pocket(&pocket, &main).await?;
     if close && report.is_complete() {
         registry.mark_swept(id, now_secs())?;
@@ -911,11 +913,11 @@ async fn start_new_connections(
                 .as_ref()
                 .context("pocket connections need --mint-url, --wallet-db and a seed")?;
             let pocket = open_pocket_for(local, config.index).await?;
-            let handler = Arc::new(PocketNwcHandler::new(
-                record.id.clone(),
-                pocket,
-                refiller.clone(),
-            )?);
+            // Shares the spend lock with `key proxy` on the same pocket.
+            let handler = Arc::new(
+                PocketNwcHandler::new(record.id.clone(), pocket, refiller.clone())?
+                    .with_spend_lock(registry.clone()),
+            );
             pockets
                 .lock()
                 .map_err(|_| anyhow::anyhow!("pocket map poisoned"))?

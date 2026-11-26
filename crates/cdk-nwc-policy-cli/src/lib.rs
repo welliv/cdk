@@ -10,6 +10,7 @@ use cdk::wallet::Wallet;
 use cdk_nwc_policy::BudgetPeriod;
 use tokio::task::JoinHandle;
 
+pub mod ecash;
 pub mod key;
 pub mod pocket;
 pub mod proxy;

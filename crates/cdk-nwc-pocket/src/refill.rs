@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
+use cdk::amount::SplitTarget;
 use cdk::{Amount, Wallet};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::error::Error;
 use crate::event::PocketEvent;
-use crate::registry::PocketRegistry;
-use crate::transfer::{balance_msat, transfer_to_pocket};
+use crate::registry::{PocketRegistry, MAIN_SPEND_LOCK};
+use crate::transfer::{balance_msat, transfer_to_pocket, transfer_to_pocket_split};
 use crate::MSAT_PER_SAT;
 
 /// Capacity of the event channel.
@@ -77,7 +78,25 @@ impl Refiller {
         wanted_msat: u64,
         now: u64,
     ) -> Result<u64, Error> {
+        self.refill_split(connection_id, pocket, wanted_msat, now, |_| {
+            SplitTarget::None
+        })
+        .await
+    }
+
+    /// [`Self::refill`], choosing the denominations the pocket receives
+    /// (see [`transfer_to_pocket_split`]).
+    pub async fn refill_split(
+        &self,
+        connection_id: &str,
+        pocket: &Wallet,
+        wanted_msat: u64,
+        now: u64,
+        split: impl Fn(Amount) -> SplitTarget,
+    ) -> Result<u64, Error> {
         let _guard = self.lock.lock().await;
+        // Another process (`serve` or `key proxy`) may spend main too.
+        let _main = self.registry.lock_spend(MAIN_SPEND_LOCK).await?;
         let config = self.registry.get(connection_id)?;
         if config.swept_at.is_some() {
             return Err(Error::PocketSwept {
@@ -118,11 +137,12 @@ impl Refiller {
                 Error::Wallet(cdk::Error::InsufficientFunds)
             });
         }
-        match transfer_to_pocket(
+        match transfer_to_pocket_split(
             &self.main,
             pocket,
             Amount::from(amount_sat),
             Some(Amount::from(max_cost_sat)),
+            split,
         )
         .await
         {
@@ -149,6 +169,7 @@ impl Refiller {
         amount_msat: u64,
     ) -> Result<u64, Error> {
         let _guard = self.lock.lock().await;
+        let _main = self.registry.lock_spend(MAIN_SPEND_LOCK).await?;
         let config = self.registry.get(connection_id)?;
         let balance = balance_msat(pocket).await?;
         if balance.saturating_add(amount_msat) > config.ceiling_msat {
